@@ -6,17 +6,6 @@ Bot de Telegram para controlar membresías de un canal o grupo (v2).
 - Expulsa automáticamente al vencer (sin bloquear: puede volver si renueva).
 - Usa Postgres si existe DATABASE_URL (Railway); si no, usa SQLite local.
 - Sistema de llaves (códigos de activación) para que los usuarios canjeen días.
-
-Variables de entorno:
-    BOT_TOKEN         token de @BotFather                      (obligatoria)
-    GROUP_ID          ID del canal/grupo, ej: -1001234567890   (obligatoria)
-    ADMIN_IDS         tus IDs separados por coma               (obligatoria)
-    DATABASE_URL      cadena de Postgres (Railway la da)       (opcional)
-    DIAS_MEMBRESIA    días por defecto                         (def. 30)
-    REMINDER_DAYS     recordatorios, días antes de vencer      (def. 5,2,1)
-    REVISION_SEGUNDOS cada cuánto revisa vencimientos          (def. 60)
-    TZ_OFFSET         diferencia horaria para mostrar fechas   (def. -5)
-    AUTO_REGISTRO     1 registra a quien entra, 0 no           (def. 1)
 """
 
 import logging
@@ -24,10 +13,12 @@ import math
 import os
 import sqlite3
 import secrets
+import httpx
 from datetime import datetime, timedelta, timezone
 
 from telegram import Update
 from telegram.error import TelegramError
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     ChatMemberHandler,
@@ -400,7 +391,6 @@ async def nuevo_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nombre = user.full_name
     fila = obtener(user.id)
 
-    # Ya estaba expulsado por vencimiento: no se regalan 30 días al volver a entrar
     if fila and fila["estado"] == "expulsado":
         log.info("Reingreso sin renovar: %s (%s)", nombre, user.id)
         await sacar_del_canal(context, user.id)
@@ -416,7 +406,6 @@ async def nuevo_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Ya tiene membresía vigente
     if fila and fila["estado"] == "activo" and parse(fila["vence"]) > ahora():
         log.info("Usuario %s ya estaba registrado", user.id)
         return
@@ -446,7 +435,6 @@ async def revisar(context: ContextTypes.DEFAULT_TYPE):
         nombre = f["nombre"] or uid
         restante = (parse(f["vence"]) - ahora_).total_seconds()
 
-        # Vencido: expulsar
         if restante <= 0:
             if await sacar_del_canal(context, uid):
                 run("UPDATE miembros SET estado = 'expulsado' WHERE user_id = ?", (uid,))
@@ -464,7 +452,6 @@ async def revisar(context: ContextTypes.DEFAULT_TYPE):
                 )
             continue
 
-        # Recordatorios (cada uno se envía una sola vez)
         enviados = {x for x in f["recordatorios"].split(",") if x}
         alcanzados = [
             d for d in REMINDER_DAYS if restante <= d * 86400 and str(d) not in enviados
@@ -494,7 +481,11 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
-    app = Application.builder().token(TOKEN).build()
+    
+    # ---- SOLUCIÓN AL ERROR DE RED (IPV6) ----
+    req = HTTPXRequest(httpx_kwargs={"transport": httpx.AsyncHTTPTransport(local_address="::")})
+    app = Application.builder().token(TOKEN).request(req).get_updates_request(req).build()
+    # ----------------------------------------
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("miid", miid))
@@ -506,7 +497,6 @@ def main():
     app.add_handler(CommandHandler("vencer", vencer))
     app.add_handler(CommandHandler("quitar", quitar))
     
-    # Nuevos comandos para las llaves
     app.add_handler(CommandHandler("crear_llave", crear_llave))
     app.add_handler(CommandHandler("canjear", canjear))
 
@@ -516,7 +506,7 @@ def main():
     app.job_queue.run_repeating(revisar, interval=REVISION_SEGUNDOS, first=10)
 
     log.info("Bot en marcha...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
