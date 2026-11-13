@@ -5,6 +5,7 @@ Bot de Telegram para controlar membresías de un canal o grupo (v2).
 - Envía recordatorios antes de vencer (una sola vez cada uno).
 - Expulsa automáticamente al vencer (sin bloquear: puede volver si renueva).
 - Usa Postgres si existe DATABASE_URL (Railway); si no, usa SQLite local.
+- Sistema de llaves (códigos de activación) para que los usuarios canjeen días.
 
 Variables de entorno:
     BOT_TOKEN         token de @BotFather                      (obligatoria)
@@ -22,6 +23,7 @@ import logging
 import math
 import os
 import sqlite3
+import secrets
 from datetime import datetime, timedelta, timezone
 
 from telegram import Update
@@ -127,6 +129,16 @@ def init_db():
         )
         """
     )
+    run(
+        """
+        CREATE TABLE IF NOT EXISTS llaves (
+            codigo TEXT PRIMARY KEY,
+            dias INTEGER NOT NULL,
+            usado_por BIGINT,
+            fecha_creacion TEXT NOT NULL
+        )
+        """
+    )
     log.info("Base de datos: %s", "Postgres" if DATABASE_URL else f"SQLite ({DB_PATH})")
 
 
@@ -199,7 +211,8 @@ def uid_arg(context):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hola. Este bot controla las membresías del canal.\n"
-        "Usa /miid para ver tu ID y compartirlo con el administrador."
+        "Usa /miid para ver tu ID y compartirlo con el administrador.\n"
+        "Si tienes una llave de activación, usa /canjear CODIGO."
     )
 
 
@@ -213,6 +226,7 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Comandos de administrador:\n"
         "/pago ID [Nombre] - renueva con los días por defecto\n"
         "/agregar ID DIAS [Nombre] - registra o suma días\n"
+        "/crear_llave DIAS - genera un código de activación\n"
         "/estado ID - días restantes\n"
         "/lista - miembros activos\n"
         "/vencer ID - hace vencer ahora (para pruebas)\n"
@@ -320,6 +334,54 @@ async def quitar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ok
         else f"{uid} eliminado de la base, pero no pude expulsarlo del canal."
     )
+
+
+@solo_admin
+async def crear_llave(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    a = context.args
+    if len(a) < 1 or not a[0].isdigit():
+        await update.message.reply_text("Uso: /crear_llave DIAS (ej: /crear_llave 30)")
+        return
+    
+    dias = int(a[0])
+    codigo = secrets.token_hex(3).upper()
+    
+    run(
+        "INSERT INTO llaves (codigo, dias, fecha_creacion) VALUES (?, ?, ?)",
+        (codigo, dias, iso(ahora()))
+    )
+    await update.message.reply_text(
+        f"✅ Llave creada por {dias} días:\n\n`{codigo}`\n\nEnvíasela al cliente.",
+        parse_mode="Markdown"
+    )
+
+
+async def canjear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    a = context.args
+    if len(a) < 1:
+        await update.message.reply_text("Uso: /canjear CODIGO")
+        return
+    
+    codigo = a[0].strip().upper()
+    uid = update.effective_user.id
+    nombre = update.effective_user.full_name
+    
+    llave = run("SELECT * FROM llaves WHERE codigo = ? AND usado_por IS NULL", (codigo,), "one")
+    
+    if not llave:
+        await update.message.reply_text("❌ Llave inválida o ya fue utilizada.")
+        return
+        
+    vence = registrar(uid, nombre, llave["dias"], sumar=True)
+    run("UPDATE llaves SET usado_por = ? WHERE codigo = ?", (uid, codigo))
+    
+    await update.message.reply_text(
+        f"🎉 ¡Llave canjeada!\n\n"
+        f"Se te han agregado **{llave['dias']} días**.\n"
+        f"Vence el: **{fecha_local(vence)}**",
+        parse_mode="Markdown"
+    )
+    await avisar_admins(context, f"El usuario {nombre} ({uid}) canjeó la llave {codigo} (+{llave['dias']} días).")
 
 
 # ---------- Entrada de nuevos miembros ----------
@@ -443,6 +505,11 @@ def main():
     app.add_handler(CommandHandler("lista", lista))
     app.add_handler(CommandHandler("vencer", vencer))
     app.add_handler(CommandHandler("quitar", quitar))
+    
+    # Nuevos comandos para las llaves
+    app.add_handler(CommandHandler("crear_llave", crear_llave))
+    app.add_handler(CommandHandler("canjear", canjear))
+
     app.add_handler(ChatMemberHandler(nuevo_miembro, ChatMemberHandler.CHAT_MEMBER))
     app.add_error_handler(error_handler)
 
