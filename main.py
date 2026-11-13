@@ -2,7 +2,7 @@
 Bot de Telegram para controlar membresías de un canal o grupo (v2).
 
 - Registra solo a quien entra al canal (30 días por defecto).
-- Envía recordatorios antes de vencer (una sola vez cada uno).
+- Envía recordatorios ante de vencer (una sola vez cada uno).
 - Expulsa automáticamente al vencer (sin bloquear: puede volver si renueva).
 - Usa Postgres si existe DATABASE_URL (Railway); si no, usa SQLite local.
 - Sistema de llaves (códigos de activación) para que los usuarios canjeen días.
