@@ -1,13 +1,33 @@
 """
 Bot de Telegram para controlar membresías de un canal o grupo (v2).
-Conectado a través de Proxy de Cloudflare.
+
+- Registra solo a quien entra al canal (30 días por defecto).
+- Envía recordatorios antes de vencer (una sola vez cada uno).
+- Expulsa automáticamente al vencer (sin bloquear: puede volver si renueva).
+- Usa Postgres si existe DATABASE_URL (Railway); si no, usa SQLite local.
+- Llaves de un solo uso (/llave, /canjear): el admin crea una llave con la
+  duración que quiera; al canjearla empieza a correr el tiempo y al vencer
+  se expulsa automáticamente. La llave queda inutilizable.
+
+Variables de entorno:
+    BOT_TOKEN         token de @BotFather                      (obligatoria)
+    GROUP_ID          ID del canal/grupo, ej: -1001234567890   (obligatoria)
+    ADMIN_IDS         tus IDs separados por coma               (obligatoria)
+    DATABASE_URL      cadena de Postgres (Railway la da)       (opcional)
+    DIAS_MEMBRESIA    días por defecto                         (def. 30)
+    REMINDER_DAYS     recordatorios, días antes de vencer      (def. 5,2,1)
+    REVISION_SEGUNDOS cada cuánto revisa vencimientos          (def. 60)
+    TZ_OFFSET         diferencia horaria para mostrar fechas   (def. -5)
+    AUTO_REGISTRO     1 registra a quien entra, 0 no           (def. 1)
+                      (usa 0 si vendes el acceso solo con llaves)
 """
 
 import logging
 import math
 import os
-import sqlite3
+import re
 import secrets
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from telegram import Update
@@ -22,7 +42,7 @@ from telegram.ext import (
 logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO
 )
-# Evita que el token aparezca en los logs
+# Evita que el token aparezca en los logs (httpx imprime la URL completa)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("membresias")
 
@@ -40,31 +60,62 @@ REMINDER_DAYS = sorted(
 REVISION_SEGUNDOS = int(os.environ.get("REVISION_SEGUNDOS", "60"))
 LOCAL_TZ = timezone(timedelta(hours=float(os.environ.get("TZ_OFFSET", "-5"))))
 AUTO_REGISTRO = os.environ.get("AUTO_REGISTRO", "1") == "1"
+ALFABETO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # sin 0/O/1/I para no confundir
+UNIDADES = {"m": 60, "h": 3600, "d": 86400}
+VIGENCIA_ENLACE = 600  # el enlace de invitación vence en 10 minutos
 
 # ---------- Tiempo ----------
 FMT = "%Y-%m-%dT%H:%M:%S"
 
+
 def ahora():
     return datetime.now(timezone.utc)
+
 
 def iso(dt):
     return dt.astimezone(timezone.utc).strftime(FMT)
 
+
 def parse(s):
     return datetime.strptime(s, FMT).replace(tzinfo=timezone.utc)
+
 
 def dias_restantes(vence_iso):
     seg = (parse(vence_iso) - ahora()).total_seconds()
     return max(0, math.ceil(seg / 86400))
 
+
 def fecha_local(vence_iso):
     return parse(vence_iso).astimezone(LOCAL_TZ).strftime("%d/%m/%Y %H:%M")
 
+
+def fmt_seg(seg):
+    """Segundos a texto corto: 2d 3h 10m."""
+    seg = max(int(seg), 0)
+    d, r = divmod(seg, 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    partes = []
+    if d:
+        partes.append(f"{d}d")
+    if h:
+        partes.append(f"{h}h")
+    if m or not partes:
+        partes.append(f"{m}m")
+    return " ".join(partes)
+
+
+def tiempo_restante(vence_iso):
+    return fmt_seg((parse(vence_iso) - ahora()).total_seconds())
+
+
 # ---------- Base de datos (Postgres o SQLite) ----------
 def run(sql, params=(), fetch=None):
+    """Ejecuta SQL escrito con '?'. fetch: None, 'one' o 'all'."""
     if DATABASE_URL:
         import psycopg2
         import psycopg2.extras
+
         conn = psycopg2.connect(DATABASE_URL)
         try:
             with conn:
@@ -91,8 +142,10 @@ def run(sql, params=(), fetch=None):
         finally:
             conn.close()
 
+
 def init_db():
-    run("""
+    run(
+        """
         CREATE TABLE IF NOT EXISTS miembros (
             user_id BIGINT PRIMARY KEY,
             nombre TEXT,
@@ -101,28 +154,37 @@ def init_db():
             recordatorios TEXT NOT NULL DEFAULT '',
             estado TEXT NOT NULL DEFAULT 'activo'
         )
-    """)
-    run("""
+        """
+    )
+    run(
+        """
         CREATE TABLE IF NOT EXISTS llaves (
             codigo TEXT PRIMARY KEY,
-            dias INTEGER NOT NULL,
-            usado_por BIGINT,
-            fecha_creacion TEXT NOT NULL
+            segundos BIGINT NOT NULL,
+            creada TEXT NOT NULL,
+            estado TEXT NOT NULL DEFAULT 'disponible',
+            usada_por BIGINT,
+            usada_en TEXT
         )
-    """)
+        """
+    )
     log.info("Base de datos: %s", "Postgres" if DATABASE_URL else f"SQLite ({DB_PATH})")
+
 
 def obtener(uid):
     return run("SELECT * FROM miembros WHERE user_id = ?", (uid,), "one")
 
-def registrar(uid, nombre, dias, sumar=True):
+
+def registrar_td(uid, nombre, delta, sumar=True):
+    """Crea o renueva. Si sumar=True y sigue vigente, suma desde su vencimiento."""
     ahora_ = ahora()
     fila = obtener(uid)
     base = ahora_
     if sumar and fila and fila["estado"] == "activo" and parse(fila["vence"]) > base:
         base = parse(fila["vence"])
-    vence = base + timedelta(days=dias)
-    run("""
+    vence = base + delta
+    run(
+        """
         INSERT INTO miembros (user_id, nombre, ultimo_pago, vence, recordatorios, estado)
         VALUES (?, ?, ?, ?, '', 'activo')
         ON CONFLICT (user_id) DO UPDATE SET
@@ -131,8 +193,15 @@ def registrar(uid, nombre, dias, sumar=True):
             vence = EXCLUDED.vence,
             recordatorios = '',
             estado = 'activo'
-        """, (uid, nombre, iso(ahora_), iso(vence)))
+        """,
+        (uid, nombre, iso(ahora_), iso(vence)),
+    )
     return iso(vence)
+
+
+def registrar(uid, nombre, dias, sumar=True):
+    return registrar_td(uid, nombre, timedelta(days=dias), sumar)
+
 
 # ---------- Utilidades ----------
 def solo_admin(func):
@@ -142,7 +211,9 @@ def solo_admin(func):
             await update.message.reply_text("No tienes permiso para usar este comando.")
             return
         return await func(update, context)
+
     return wrapper
+
 
 async def avisar_admins(context, texto):
     for adm in ADMIN_IDS:
@@ -151,30 +222,68 @@ async def avisar_admins(context, texto):
         except TelegramError as e:
             log.warning("No pude avisar al admin %s: %s", adm, e)
 
+
 async def sacar_del_canal(context, uid):
+    """Expulsa sin bloquear. Devuelve True si funcionó."""
     try:
         await context.bot.ban_chat_member(GROUP_ID, uid)
-        await context.bot.unban_chat_member(GROUP_ID, uid, only_if_is_banned=True)
+        await context.bot.unban_chat_member(GROUP_ID, uid, only_if_banned=True)
         return True
     except TelegramError as e:
         log.error("No pude expulsar a %s: %s", uid, e)
         return False
+
 
 def uid_arg(context):
     if context.args and context.args[0].isdigit():
         return int(context.args[0])
     return None
 
+
+def parse_duracion(txt):
+    """'30d', '12h', '90m' -> segundos (o None si no es válido)."""
+    m = re.fullmatch(r"(\d+)([mhd])", txt.strip().lower())
+    if not m or int(m.group(1)) <= 0:
+        return None
+    return int(m.group(1)) * UNIDADES[m.group(2)]
+
+
+def nuevo_codigo():
+    return "-".join(
+        "".join(secrets.choice(ALFABETO) for _ in range(4)) for _ in range(3)
+    )
+
+
+async def crear_enlace(context):
+    link = await context.bot.create_chat_invite_link(
+        GROUP_ID,
+        member_limit=1,
+        expire_date=int(ahora().timestamp()) + VIGENCIA_ENLACE,
+    )
+    return link.invite_link
+
+
+async def ya_esta_en_canal(context, uid):
+    try:
+        m = await context.bot.get_chat_member(GROUP_ID, uid)
+        return m.status in ("member", "administrator", "creator")
+    except TelegramError:
+        return False
+
+
 # ---------- Comandos ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hola. Este bot controla las membresías del canal.\n"
-        "Usa /miid para ver tu ID y compartirlo con el administrador.\n"
-        "Si tienes una llave de activación, usa /canjear CODIGO."
+        "Si tienes una llave, actívala con: /canjear TU-LLAVE\n"
+        "Si tu enlace venció y tu membresía sigue activa: /enlace\n"
+        "Usa /miid para ver tu ID y compartirlo con el administrador."
     )
+
 
 async def miid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Tu ID de Telegram es: {update.effective_user.id}")
+
 
 @solo_admin
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -182,12 +291,15 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Comandos de administrador:\n"
         "/pago ID [Nombre] - renueva con los días por defecto\n"
         "/agregar ID DIAS [Nombre] - registra o suma días\n"
-        "/crear_llave DIAS - genera un código de activación\n"
         "/estado ID - días restantes\n"
         "/lista - miembros activos\n"
         "/vencer ID - hace vencer ahora (para pruebas)\n"
-        "/quitar ID - elimina y expulsa"
+        "/quitar ID - elimina y expulsa\n"
+        "/llave 30d - crea una llave (m = minutos, h = horas, d = días)\n"
+        "/llaves - ver llaves disponibles y usadas\n"
+        "/revocar CODIGO - anula una llave sin usar"
     )
+
 
 @solo_admin
 async def agregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -198,9 +310,11 @@ async def agregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid, dias = int(a[0]), int(a[1])
     nombre = " ".join(a[2:]) or None
     vence = registrar(uid, nombre, dias)
+    log.info("Membresía registrada: %s (%s) +%s días", nombre, uid, dias)
     await update.message.reply_text(
         f"Membresía de {nombre or uid} activa hasta {fecha_local(vence)}."
     )
+
 
 @solo_admin
 async def pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,9 +324,11 @@ async def pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     nombre = " ".join(context.args[1:]) or None
     vence = registrar(uid, nombre, DIAS_MEMBRESIA)
+    log.info("Pago registrado: %s (+%s días)", uid, DIAS_MEMBRESIA)
     await update.message.reply_text(
         f"Pago registrado. Activa hasta {fecha_local(vence)} ({DIAS_MEMBRESIA} días)."
     )
+
 
 @solo_admin
 async def estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -228,18 +344,21 @@ async def estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{f['nombre'] or uid}: expulsado por vencimiento.")
         return
     await update.message.reply_text(
-        f"{f['nombre'] or uid}: {dias_restantes(f['vence'])} días restantes "
+        f"{f['nombre'] or uid}: quedan {tiempo_restante(f['vence'])} "
         f"(vence {fecha_local(f['vence'])})."
     )
 
+
 @solo_admin
 async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    filas = run("SELECT * FROM miembros WHERE estado = 'activo' ORDER BY vence", (), "all")
+    filas = run(
+        "SELECT * FROM miembros WHERE estado = 'activo' ORDER BY vence", (), "all"
+    )
     if not filas:
         await update.message.reply_text("No hay membresías activas.")
         return
     lineas = [
-        f"{f['nombre'] or '-'} ({f['user_id']}): {dias_restantes(f['vence'])} días"
+        f"{f['nombre'] or '-'} ({f['user_id']}): {tiempo_restante(f['vence'])}"
         for f in filas
     ]
     bloque = f"Activos: {len(filas)}\n"
@@ -250,6 +369,7 @@ async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bloque += linea + "\n"
     await update.message.reply_text(bloque)
 
+
 @solo_admin
 async def vencer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = uid_arg(context)
@@ -259,8 +379,14 @@ async def vencer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not obtener(uid):
         await update.message.reply_text("Ese usuario no está registrado.")
         return
-    run("UPDATE miembros SET vence = ?, estado = 'activo' WHERE user_id = ?", (iso(ahora() - timedelta(minutes=1)), uid))
-    await update.message.reply_text(f"Marcado como vencido. Se expulsará en menos de {REVISION_SEGUNDOS} segundos.")
+    run(
+        "UPDATE miembros SET vence = ?, estado = 'activo' WHERE user_id = ?",
+        (iso(ahora() - timedelta(minutes=1)), uid),
+    )
+    await update.message.reply_text(
+        f"Marcado como vencido. Se expulsará en menos de {REVISION_SEGUNDOS} segundos."
+    )
+
 
 @solo_admin
 async def quitar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,42 +396,171 @@ async def quitar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     run("DELETE FROM miembros WHERE user_id = ?", (uid,))
     ok = await sacar_del_canal(context, uid)
-    await update.message.reply_text(f"{uid} eliminado y expulsado." if ok else f"{uid} eliminado de la base, pero no pude expulsarlo del canal.")
+    await update.message.reply_text(
+        f"{uid} eliminado y expulsado."
+        if ok
+        else f"{uid} eliminado de la base, pero no pude expulsarlo del canal."
+    )
+
+
+# ---------- Llaves de un solo uso ----------
+@solo_admin
+async def llave(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Crea las llaves por privado con el bot.")
+        return
+    seg = parse_duracion(context.args[0]) if context.args else None
+    if not seg:
+        await update.message.reply_text(
+            "Uso: /llave 30d\n(m = minutos, h = horas, d = días)"
+        )
+        return
+    codigo = nuevo_codigo()
+    run(
+        "INSERT INTO llaves (codigo, segundos, creada) VALUES (?, ?, ?)",
+        (codigo, seg, iso(ahora())),
+    )
+    log.info("Llave creada: %s (%s)", codigo, fmt_seg(seg))
+    await update.message.reply_html(
+        f"Llave creada:\n<code>{codigo}</code>\n"
+        f"Duración: {fmt_seg(seg)} (empieza a contar cuando el usuario la canjee)."
+    )
+
 
 @solo_admin
-async def crear_llave(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    a = context.args
-    if len(a) < 1 or not a[0].isdigit():
-        await update.message.reply_text("Uso: /crear_llave DIAS (ej: /crear_llave 30)")
+async def llaves(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
         return
-    
-    dias = int(a[0])
-    codigo = secrets.token_hex(3).upper()
-    
-    run("INSERT INTO llaves (codigo, dias, fecha_creacion) VALUES (?, ?, ?)", (codigo, dias, iso(ahora())))
-    await update.message.reply_text(f"✅ Llave creada por {dias} días:\n\n`{codigo}`\n\nEnvíasela al cliente.", parse_mode="Markdown")
+    disp = run(
+        "SELECT codigo, segundos FROM llaves WHERE estado = 'disponible' ORDER BY creada",
+        (),
+        "all",
+    )
+    usadas = run(
+        "SELECT codigo, usada_por, usada_en FROM llaves "
+        "WHERE estado = 'usada' ORDER BY usada_en DESC LIMIT 10",
+        (),
+        "all",
+    )
+    txt = f"<b>Disponibles ({len(disp)})</b>\n"
+    txt += (
+        "\n".join(f"<code>{f['codigo']}</code> · {fmt_seg(f['segundos'])}" for f in disp[:30])
+        or "—"
+    )
+    if len(disp) > 30:
+        txt += f"\n…y {len(disp) - 30} más"
+    txt += "\n\n<b>Usadas (últimas 10)</b>\n"
+    txt += (
+        "\n".join(
+            f"<code>{f['codigo']}</code> · {f['usada_por']} · {fecha_local(f['usada_en'])}"
+            for f in usadas
+        )
+        or "—"
+    )
+    await update.message.reply_html(txt)
+
+
+@solo_admin
+async def revocar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Uso: /revocar CODIGO")
+        return
+    codigo = context.args[0].strip().upper()
+    fila = run(
+        "UPDATE llaves SET estado = 'revocada' "
+        "WHERE codigo = ? AND estado = 'disponible' RETURNING codigo",
+        (codigo,),
+        "one",
+    )
+    await update.message.reply_text(
+        "Llave revocada." if fila else "No existe o ya fue usada."
+    )
+
 
 async def canjear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    a = context.args
-    if len(a) < 1:
-        await update.message.reply_text("Uso: /canjear CODIGO")
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Escríbeme por privado para canjear tu llave.")
         return
-    
-    codigo = a[0].strip().upper()
-    uid = update.effective_user.id
-    nombre = update.effective_user.full_name
-    
-    llave = run("SELECT * FROM llaves WHERE codigo = ? AND usado_por IS NULL", (codigo,), "one")
-    
-    if not llave:
-        await update.message.reply_text("❌ Llave inválida o ya fue utilizada.")
+    if not context.args:
+        await update.message.reply_text("Uso: /canjear TU-LLAVE")
         return
-        
-    vence = registrar(uid, nombre, llave["dias"], sumar=True)
-    run("UPDATE llaves SET usado_por = ? WHERE codigo = ?", (uid, codigo))
-    
-    await update.message.reply_text(f"🎉 ¡Llave canjeada!\n\nSe te han agregado **{llave['dias']} días**.\nVence el: **{fecha_local(vence)}**", parse_mode="Markdown")
-    await avisar_admins(context, f"El usuario {nombre} ({uid}) canjeó la llave {codigo} (+{llave['dias']} días).")
+
+    user = update.effective_user
+    codigo = context.args[0].strip().upper()
+
+    # Marca la llave como usada en un solo paso: si dos personas la canjean a la
+    # vez, solo una recibe la fila de vuelta.
+    fila = run(
+        "UPDATE llaves SET estado = 'usada', usada_por = ?, usada_en = ? "
+        "WHERE codigo = ? AND estado = 'disponible' RETURNING segundos",
+        (user.id, iso(ahora()), codigo),
+        "one",
+    )
+    if not fila:
+        await update.message.reply_text("Llave inválida o ya utilizada.")
+        return
+
+    segundos = int(fila["segundos"])
+    try:
+        vence = registrar_td(user.id, user.full_name, timedelta(seconds=segundos))
+    except Exception:
+        log.exception("Error registrando la membresía de la llave %s", codigo)
+        run(
+            "UPDATE llaves SET estado = 'disponible', usada_por = NULL, usada_en = NULL "
+            "WHERE codigo = ?",
+            (codigo,),
+        )
+        await update.message.reply_text(
+            "Hubo un error. Tu llave sigue vigente, intenta de nuevo en un momento."
+        )
+        return
+
+    log.info("Llave %s canjeada por %s (%s)", codigo, user.full_name, user.id)
+    await avisar_admins(
+        context,
+        f"Llave {codigo} canjeada por {user.full_name} ({user.id}). "
+        f"Vence {fecha_local(vence)}.",
+    )
+
+    texto = (
+        f"Llave activada ({fmt_seg(segundos)}). "
+        f"Tu membresía vence el {fecha_local(vence)}."
+    )
+    if await ya_esta_en_canal(context, user.id):
+        await update.message.reply_text(texto + "\nYa estás dentro del canal.")
+        return
+    try:
+        url = await crear_enlace(context)
+    except TelegramError as e:
+        log.error("No pude crear el enlace: %s", e)
+        await update.message.reply_text(
+            texto + "\nNo pude generar el enlace, escribe /enlace en un momento."
+        )
+        return
+    await update.message.reply_text(
+        texto
+        + f"\n\nEntra aquí (sirve una sola vez y vence en {VIGENCIA_ENLACE // 60} min):\n{url}"
+    )
+
+
+async def enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    f = obtener(update.effective_user.id)
+    if not f or f["estado"] != "activo" or parse(f["vence"]) <= ahora():
+        await update.message.reply_text("No tienes una membresía activa.")
+        return
+    try:
+        url = await crear_enlace(context)
+    except TelegramError as e:
+        log.error("No pude crear el enlace: %s", e)
+        await update.message.reply_text("No pude generar el enlace, intenta de nuevo.")
+        return
+    await update.message.reply_text(
+        f"Te quedan {tiempo_restante(f['vence'])}.\n"
+        f"Enlace (una sola vez, vence en {VIGENCIA_ENLACE // 60} min):\n{url}"
+    )
+
 
 # ---------- Entrada de nuevos miembros ----------
 async def nuevo_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -323,85 +578,18 @@ async def nuevo_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nombre = user.full_name
     fila = obtener(user.id)
 
+    # Ya estaba expulsado por vencimiento: no se regalan 30 días al volver a entrar
     if fila and fila["estado"] == "expulsado":
+        log.info("Reingreso sin renovar: %s (%s)", nombre, user.id)
         await sacar_del_canal(context, user.id)
         try:
-            await context.bot.send_message(user.id, "Tu membresía venció. Contacta al administrador para renovar y volver a entrar.")
+            await context.bot.send_message(
+                user.id,
+                "Tu membresía venció. Contacta al administrador para renovar y volver a entrar.",
+            )
         except TelegramError:
             pass
-        return
-
-    if fila and fila["estado"] == "activo" and parse(fila["vence"]) > ahora():
-        return
-
-    if not AUTO_REGISTRO:
-        await avisar_admins(context, f"Entró sin membresía registrada: {nombre} ({user.id}).")
-        return
-
-    vence = registrar(user.id, nombre, DIAS_MEMBRESIA, sumar=False)
-    await avisar_admins(context, f"Nuevo miembro registrado: {nombre} ({user.id}). Vence {fecha_local(vence)}.")
-
-# ---------- Temporizador ----------
-async def revisar(context: ContextTypes.DEFAULT_TYPE):
-    filas = run("SELECT * FROM miembros WHERE estado = 'activo'", (), "all")
-    ahora_ = ahora()
-
-    for f in filas:
-        uid = f["user_id"]
-        nombre = f["nombre"] or uid
-        restante = (parse(f["vence"]) - ahora_).total_seconds()
-
-        if restante <= 0:
-            if await sacar_del_canal(context, uid):
-                run("UPDATE miembros SET estado = 'expulsado' WHERE user_id = ?", (uid,))
-                try:
-                    await context.bot.send_message(uid, "Tu membresía venció y fuiste retirado del canal.")
-                except TelegramError:
-                    pass
-                await avisar_admins(context, f"Expulsado por vencimiento: {nombre} ({uid}).")
-            continue
-
-        enviados = {x for x in f["recordatorios"].split(",") if x}
-        alcanzados = [d for d in REMINDER_DAYS if restante <= d * 86400 and str(d) not in enviados]
-        if not alcanzados:
-            continue
-        enviados.update(str(d) for d in alcanzados)
-        run("UPDATE miembros SET recordatorios = ? WHERE user_id = ?", (",".join(sorted(enviados)), uid))
-        dias = dias_restantes(f["vence"])
-        try:
-            await context.bot.send_message(uid, f"Tu membresía vence en {dias} día(s) ({fecha_local(f['vence'])}).")
-        except TelegramError:
-            pass
-
-async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
-    log.error("Error: %s", context.error)
-
-def main():
-    init_db()
-    
-    # ---- CONEXIÓN A TRAVÉS DE TU PROXY DE CLOUDFLARE ----
-    app = Application.builder().token(TOKEN).base_url("https://empty-lake-2fdc.karosbruja62.workers.dev/bot").build()
-    # ----------------------------------------------------
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("miid", miid))
-    app.add_handler(CommandHandler("ayuda", ayuda))
-    app.add_handler(CommandHandler("agregar", agregar))
-    app.add_handler(CommandHandler("pago", pago))
-    app.add_handler(CommandHandler("estado", estado))
-    app.add_handler(CommandHandler("lista", lista))
-    app.add_handler(CommandHandler("vencer", vencer))
-    app.add_handler(CommandHandler("quitar", quitar))
-    app.add_handler(CommandHandler("crear_llave", crear_llave))
-    app.add_handler(CommandHandler("canjear", canjear))
-
-    app.add_handler(ChatMemberHandler(nuevo_miembro, ChatMemberHandler.CHAT_MEMBER))
-    app.add_error_handler(error_handler)
-
-    app.job_queue.run_repeating(revisar, interval=REVISION_SEGUNDOS, first=10)
-
-    log.info("Bot en marcha a través de Cloudflare...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
+        await avisar_admins(
+            context, f"Reingreso sin renovar, expulsado de nuevo: {nombre} ({user.id})."
+        )
+   
