@@ -173,6 +173,11 @@ def init_db():
         )
         """
     )
+    for col in ("renovaciones INTEGER NOT NULL DEFAULT 0", "expulsado_en TEXT"):
+        try:  # migración simple: ignora si la columna ya existe
+            run(f"ALTER TABLE miembros ADD COLUMN {col}")
+        except Exception:
+            pass
     run(
         """
         CREATE TABLE IF NOT EXISTS llaves (
@@ -219,9 +224,11 @@ def registrar_td(uid, nombre, delta, sumar=True):
             ultimo_pago = EXCLUDED.ultimo_pago,
             vence = EXCLUDED.vence,
             recordatorios = '',
-            estado = 'activo'
+            estado = 'activo',
+            renovaciones = miembros.renovaciones + ?,
+            expulsado_en = NULL
         """,
-        (uid, nombre, iso(ahora_), iso(vence)),
+        (uid, nombre, iso(ahora_), iso(vence), 1 if fila else 0),
     )
     return iso(vence)
 
@@ -465,6 +472,7 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/agregar ID DIAS [Nombre] - registra o suma días\n"
         "/estado ID - días restantes\n"
         "/lista - miembros activos\n"
+        "/usuarios - todos: activos, salidos, tiempo y renovaciones\n"
         "/vencer ID - hace vencer ahora (para pruebas)\n"
         "/quitar ID - elimina y expulsa\n"
         "/llave 30d - crea una llave (m = minutos, h = horas, d = días)\n"
@@ -553,6 +561,37 @@ async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for f in filas
     ]
     bloque = f"Activos: {len(filas)}\n"
+    for linea in lineas:
+        if len(bloque) + len(linea) > 3500:
+            await update.message.reply_text(bloque)
+            bloque = ""
+        bloque += linea + "\n"
+    await update.message.reply_text(bloque)
+
+
+@solo_admin
+async def usuarios(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    filas = run("SELECT * FROM miembros ORDER BY vence", (), "all")
+    if not filas:
+        await update.message.reply_text("No hay usuarios registrados.")
+        return
+    activos = [f for f in filas if f["estado"] == "activo"]
+    salidos = [f for f in filas if f["estado"] != "activo"]
+    lineas = [f"ACTIVOS ({len(activos)})"]
+    for f in activos:
+        lineas.append(
+            f"{f['nombre'] or '-'} ({f['user_id']}): quedan {tiempo_restante(f['vence'])}"
+            f", vence {fecha_local(f['vence'])}, renovaciones: {f['renovaciones']}"
+        )
+    lineas.append("")
+    lineas.append(f"SALIERON POR VENCIMIENTO ({len(salidos)})")
+    for f in salidos:
+        cuando = f" el {fecha_local(f['expulsado_en'])}" if f.get("expulsado_en") else ""
+        lineas.append(
+            f"{f['nombre'] or '-'} ({f['user_id']}): venció {fecha_local(f['vence'])}"
+            f", expulsado{cuando}, renovaciones: {f['renovaciones']}"
+        )
+    bloque = ""
     for linea in lineas:
         if len(bloque) + len(linea) > 3500:
             await update.message.reply_text(bloque)
@@ -818,7 +857,11 @@ async def revisar(context: ContextTypes.DEFAULT_TYPE):
         # Vencido: expulsar
         if restante <= 0:
             if await sacar_del_canal(context, uid):
-                run("UPDATE miembros SET estado = 'expulsado' WHERE user_id = ?", (uid,))
+                run(
+                    "UPDATE miembros SET estado = 'expulsado', expulsado_en = ? "
+                    "WHERE user_id = ?",
+                    (iso(ahora()), uid),
+                )
                 log.info("EXPULSIÓN EXITOSA: %s (%s)", nombre, uid)
                 try:
                     await context.bot.send_message(
@@ -889,6 +932,7 @@ def main():
     app.add_handler(CommandHandler("pago", pago))
     app.add_handler(CommandHandler("estado", estado))
     app.add_handler(CommandHandler("lista", lista))
+    app.add_handler(CommandHandler("usuarios", usuarios))
     app.add_handler(CommandHandler("vencer", vencer))
     app.add_handler(CommandHandler("quitar", quitar))
     app.add_handler(CommandHandler("llave", llave))
