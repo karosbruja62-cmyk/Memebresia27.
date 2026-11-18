@@ -17,6 +17,8 @@ Opcionales: DIAS_MEMBRESIA (30), REMINDER_DAYS (5,2,1), REVISION_SEGUNDOS (60), 
 
 - /pago ID [Nombre]: renueva con los días por defecto
 - /agregar ID DIAS [Nombre]: registra o suma días
+- /tiempo: cualquier usuario ve cuánto le queda
+- /usuarios: listado completo (activos, salidos por vencimiento, tiempo restante, renovaciones)
 - /estado ID, /lista
 - /vencer ID: hace vencer ahora (pruebas)
 - /quitar ID: elimina y expulsa
