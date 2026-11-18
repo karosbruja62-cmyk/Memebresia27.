@@ -27,6 +27,13 @@ import logging
 import math
 import os
 import re
+import asyncio
+import hashlib
+import hmac
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlencode
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -63,6 +70,13 @@ LOCAL_TZ = timezone(timedelta(hours=float(os.environ.get("TZ_OFFSET", "-5"))))
 AUTO_REGISTRO = os.environ.get("AUTO_REGISTRO", "1") == "1"
 # Si el hosting no puede llegar a api.telegram.org, pasa por tu proxy (ej. Cloudflare Worker)
 TELEGRAM_API_PROXY = os.environ.get("TELEGRAM_API_PROXY", "").strip().rstrip("/")
+# Wompi (opcional: si falta WOMPI_PUBLIC_KEY el cobro queda desactivado)
+WOMPI_PUBLIC_KEY = os.environ.get("WOMPI_PUBLIC_KEY", "").strip()
+WOMPI_INTEGRITY_SECRET = os.environ.get("WOMPI_INTEGRITY_SECRET", "").strip()
+WOMPI_EVENTS_SECRET = os.environ.get("WOMPI_EVENTS_SECRET", "").strip()
+WOMPI_PRECIO_COP = int(os.environ.get("WOMPI_PRECIO_COP", "0"))  # en pesos
+WOMPI_REDIRECT_URL = os.environ.get("WOMPI_REDIRECT_URL", "").strip()
+PORT = int(os.environ.get("PORT", "8080"))
 ALFABETO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # sin 0/O/1/I para no confundir
 UNIDADES = {"m": 60, "h": 3600, "d": 86400}
 VIGENCIA_ENLACE = 600  # el enlace de invitación vence en 10 minutos
@@ -171,6 +185,16 @@ def init_db():
         )
         """
     )
+    run(
+        """
+        CREATE TABLE IF NOT EXISTS pagos_wompi (
+            transaccion TEXT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            monto_centavos BIGINT,
+            creado TEXT NOT NULL
+        )
+        """
+    )
     log.info("Base de datos: %s", "Postgres" if DATABASE_URL else f"SQLite ({DB_PATH})")
 
 
@@ -274,10 +298,154 @@ async def ya_esta_en_canal(context, uid):
         return False
 
 
+# ---------- Wompi ----------
+def wompi_activo():
+    return bool(
+        WOMPI_PUBLIC_KEY and WOMPI_INTEGRITY_SECRET and WOMPI_EVENTS_SECRET
+        and WOMPI_PRECIO_COP > 0
+    )
+
+
+def wompi_enlace(uid):
+    """Enlace de checkout firmado. La referencia lleva el ID de Telegram."""
+    referencia = f"M27-{uid}-{int(ahora().timestamp())}"
+    centavos = WOMPI_PRECIO_COP * 100
+    firma = hashlib.sha256(
+        f"{referencia}{centavos}COP{WOMPI_INTEGRITY_SECRET}".encode()
+    ).hexdigest()
+    params = {
+        "public-key": WOMPI_PUBLIC_KEY,
+        "currency": "COP",
+        "amount-in-cents": centavos,
+        "reference": referencia,
+        "signature:integrity": firma,
+    }
+    if WOMPI_REDIRECT_URL:
+        params["redirect-url"] = WOMPI_REDIRECT_URL
+    return "https://checkout.wompi.co/p/?" + urlencode(params, safe=":/")
+
+
+def wompi_checksum_valido(evento):
+    """checksum = sha256(valores de signature.properties + timestamp + secreto de eventos)."""
+    try:
+        sig = evento["signature"]
+        valores = ""
+        for prop in sig["properties"]:
+            nodo = evento["data"]
+            for parte in prop.split("."):
+                nodo = nodo[parte]
+            valores += str(nodo)
+        calculado = hashlib.sha256(
+            f"{valores}{evento['timestamp']}{WOMPI_EVENTS_SECRET}".encode()
+        ).hexdigest()
+        return hmac.compare_digest(calculado, str(sig["checksum"]).lower())
+    except (KeyError, TypeError):
+        return False
+
+
+async def procesar_pago_wompi(app, evento):
+    tx = evento["data"]["transaction"]
+    if tx.get("status") != "APPROVED":
+        return
+    m = re.fullmatch(r"M27-(\d+)-\d+", str(tx.get("reference", "")))
+    if not m:
+        log.warning("Pago Wompi con referencia desconocida: %s", tx.get("reference"))
+        return
+    if WOMPI_PRECIO_COP and tx.get("amount_in_cents") != WOMPI_PRECIO_COP * 100:
+        log.warning("Pago Wompi %s con monto inesperado", tx.get("id"))
+        return
+    uid = int(m.group(1))
+    # Idempotencia: Wompi puede reenviar el mismo evento
+    try:
+        run(
+            "INSERT INTO pagos_wompi (transaccion, user_id, monto_centavos, creado) "
+            "VALUES (?, ?, ?, ?)",
+            (str(tx["id"]), uid, tx.get("amount_in_cents"), iso(ahora())),
+        )
+    except Exception:
+        log.info("Pago Wompi %s ya procesado", tx.get("id"))
+        return
+    vence = registrar(uid, None, DIAS_MEMBRESIA)
+    log.info("Pago Wompi %s: %s renovado", tx["id"], uid)
+
+    class Ctx:  # imita el context que usan las utilidades
+        bot = app.bot
+    ctx = Ctx()
+    await avisar_admins(ctx, f"Pago Wompi aprobado de {uid}. Vence {fecha_local(vence)}.")
+    texto = f"Pago recibido. Tu membresía vence el {fecha_local(vence)}."
+    try:
+        if await ya_esta_en_canal(ctx, uid):
+            await app.bot.send_message(uid, texto + "\nYa estás dentro del canal.")
+        else:
+            url = await crear_enlace(ctx)
+            await app.bot.send_message(
+                uid,
+                texto + f"\n\nEntra aquí (sirve una sola vez y vence en "
+                f"{VIGENCIA_ENLACE // 60} min):\n{url}",
+            )
+    except TelegramError as e:
+        log.error("No pude avisar a %s: %s", uid, e)
+
+
+def iniciar_servidor_webhook(app, loop):
+    class Handler(BaseHTTPRequestHandler):
+        def _responder(self, code, texto="ok"):
+            self.send_response(code)
+            self.end_headers()
+            self.wfile.write(texto.encode())
+
+        def do_GET(self):
+            self._responder(200)  # healthcheck
+
+        def do_POST(self):
+            if self.path != "/wompi/webhook" or not wompi_activo():
+                return self._responder(404, "no")
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                evento = json.loads(self.rfile.read(min(n, 1_000_000)))
+            except Exception:
+                return self._responder(400, "bad")
+            if not wompi_checksum_valido(evento):
+                log.warning("Webhook Wompi con firma inválida")
+                return self._responder(401, "firma")
+            if evento.get("event") == "transaction.updated":
+                fut = asyncio.run_coroutine_threadsafe(
+                    procesar_pago_wompi(app, evento), loop
+                )
+                try:
+                    fut.result(timeout=30)
+                except Exception:
+                    log.exception("Error procesando pago Wompi")
+                    return self._responder(500, "error")  # Wompi reintenta
+            self._responder(200)
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log.info("Servidor HTTP en el puerto %s (webhook Wompi: %s)", PORT,
+             "activo" if wompi_activo() else "desactivado")
+
+
+async def pagar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Escríbeme por privado para pagar.")
+        return
+    if not wompi_activo():
+        await update.message.reply_text("El pago en línea no está disponible por ahora.")
+        return
+    await update.message.reply_text(
+        f"Membresía de {DIAS_MEMBRESIA} días: ${WOMPI_PRECIO_COP:,} COP.\n"
+        f"Paga aquí y te llega el acceso automáticamente:\n{wompi_enlace(update.effective_user.id)}"
+    )
+
+
 # ---------- Comandos ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hola. Este bot controla las membresías del canal.\n"
+        "Para pagar en línea con Wompi: /pagar\n"
         "Si tienes una llave, actívala con: /canjear TU-LLAVE\n"
         "Si tu enlace venció y tu membresía sigue activa: /enlace\n"
         "Usa /miid para ver tu ID y compartirlo con el administrador."
@@ -687,10 +855,14 @@ def main():
     if TELEGRAM_API_PROXY:
         builder = builder.base_url(TELEGRAM_API_PROXY + "/bot")
         log.info("Usando proxy para la API de Telegram")
-    app = builder.build()
+    async def post_init(application):
+        iniciar_servidor_webhook(application, asyncio.get_running_loop())
+
+    app = builder.post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("miid", miid))
+    app.add_handler(CommandHandler("pagar", pagar))
     app.add_handler(CommandHandler("ayuda", ayuda))
     app.add_handler(CommandHandler("agregar", agregar))
     app.add_handler(CommandHandler("pago", pago))
