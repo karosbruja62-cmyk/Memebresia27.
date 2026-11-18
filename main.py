@@ -446,6 +446,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hola. Este bot controla las membresías del canal.\n"
         "Para pagar en línea con Wompi: /pagar\n"
+        "Para ver cuánto tiempo te queda: /tiempo\n"
         "Si tienes una llave, actívala con: /canjear TU-LLAVE\n"
         "Si tu enlace venció y tu membresía sigue activa: /enlace\n"
         "Usa /miid para ver tu ID y compartirlo con el administrador."
@@ -517,6 +518,25 @@ async def estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"{f['nombre'] or uid}: quedan {tiempo_restante(f['vence'])} "
         f"(vence {fecha_local(f['vence'])})."
+    )
+
+
+async def tiempo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    f = obtener(update.effective_user.id)
+    if not f:
+        await update.message.reply_text(
+            "No tienes una membresía registrada. Para obtenerla usa /pagar "
+            "o /canjear TU-LLAVE."
+        )
+        return
+    if f["estado"] != "activo" or parse(f["vence"]) <= ahora():
+        await update.message.reply_text(
+            "Tu membresía venció. Para renovarla usa /pagar o /canjear TU-LLAVE."
+        )
+        return
+    await update.message.reply_text(
+        f"Te quedan {tiempo_restante(f['vence'])}.\n"
+        f"Tu membresía vence el {fecha_local(f['vence'])}."
     )
 
 
@@ -863,6 +883,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("miid", miid))
     app.add_handler(CommandHandler("pagar", pagar))
+    app.add_handler(CommandHandler("tiempo", tiempo))
     app.add_handler(CommandHandler("ayuda", ayuda))
     app.add_handler(CommandHandler("agregar", agregar))
     app.add_handler(CommandHandler("pago", pago))

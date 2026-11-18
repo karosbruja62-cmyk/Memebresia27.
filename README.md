@@ -30,6 +30,7 @@ El usuario escribe /pagar al bot, paga, y recibe su enlace de acceso solo.
 
 - /pago ID [Nombre]: renueva con los días por defecto
 - /agregar ID DIAS [Nombre]: registra o suma días
+- /tiempo: cualquier usuario ve cuánto le queda
 - /estado ID, /lista
 - /vencer ID: hace vencer ahora (pruebas)
 - /quitar ID: elimina y expulsa
