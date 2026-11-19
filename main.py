@@ -1,27 +1,4 @@
-"""
-Bot de Telegram para controlar membresías de un canal o grupo (v2).
-
-- Registra solo a quien entra al canal (30 días por defecto).
-- Envía recordatorios antes de vencer (una sola vez cada uno).
-- Expulsa automáticamente al vencer (sin bloquear: puede volver si renueva).
-- Usa Postgres si existe DATABASE_URL (Railway); si no, usa SQLite local.
-- Llaves de un solo uso (/llave, /canjear): el admin crea una llave con la
-  duración que quiera; al canjearla empieza a correr el tiempo y al vencer
-  se expulsa automáticamente. La llave queda inutilizable.
-
-Variables de entorno:
-    BOT_TOKEN         token de @BotFather                      (obligatoria)
-    GROUP_ID          ID del canal/grupo, ej: -1001234567890   (obligatoria)
-    ADMIN_IDS         tus IDs separados por coma               (obligatoria)
-    DATABASE_URL      cadena de Postgres (Railway la da)       (opcional)
-    DIAS_MEMBRESIA    días por defecto                         (def. 30)
-    REMINDER_DAYS     recordatorios, días antes de vencer      (def. 5,2,1)
-    REVISION_SEGUNDOS cada cuánto revisa vencimientos          (def. 60)
-    TZ_OFFSET         diferencia horaria para mostrar fechas   (def. -5)
-    AUTO_REGISTRO     1 registra a quien entra, 0 no           (def. 1)
-    TELEGRAM_API_PROXY URL de un proxy hacia api.telegram.org  (opcional)
-                      (usa 0 si vendes el acceso solo con llaves)
-"""
+"""Bot de Telegram para controlar membresías por canal o grupo."""
 
 import logging
 import math
@@ -33,42 +10,36 @@ from datetime import datetime, timedelta, timezone
 
 from telegram import Update
 from telegram.error import TelegramError
-from telegram.ext import (
-    Application,
-    ChatMemberHandler,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, ChatMemberHandler, CommandHandler, ContextTypes
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO
-)
-# Evita que el token aparezca en los logs (httpx imprime la URL completa)
+logging.basicConfig(format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("membresias")
 
-# ---------- Configuración ----------
 TOKEN = os.environ["BOT_TOKEN"]
-GROUP_ID = int(os.environ["GROUP_ID"])
 ADMIN_IDS = {int(x) for x in os.environ["ADMIN_IDS"].split(",") if x.strip()}
 DATABASE_URL = os.environ.get("DATABASE_URL")
 DB_PATH = os.environ.get("DB_PATH", "membresias_v2.db")
 DIAS_MEMBRESIA = int(os.environ.get("DIAS_MEMBRESIA", "30"))
-REMINDER_DAYS = sorted(
-    {int(x) for x in os.environ.get("REMINDER_DAYS", "5,2,1").split(",") if x.strip()},
-    reverse=True,
-)
+REMINDER_DAYS = sorted({int(x) for x in os.environ.get("REMINDER_DAYS", "5,2,1").split(",") if x.strip()}, reverse=True)
 REVISION_SEGUNDOS = int(os.environ.get("REVISION_SEGUNDOS", "60"))
 LOCAL_TZ = timezone(timedelta(hours=float(os.environ.get("TZ_OFFSET", "-5"))))
 AUTO_REGISTRO = os.environ.get("AUTO_REGISTRO", "1") == "1"
-# Si el hosting no puede llegar a api.telegram.org, pasa por tu proxy (ej. Cloudflare Worker)
 TELEGRAM_API_PROXY = os.environ.get("TELEGRAM_API_PROXY", "").strip().rstrip("/")
-ALFABETO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # sin 0/O/1/I para no confundir
+ALFABETO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 UNIDADES = {"m": 60, "h": 3600, "d": 86400}
-VIGENCIA_ENLACE = 600  # el enlace de invitación vence en 10 minutos
-
-# ---------- Tiempo ----------
+VIGENCIA_ENLACE = 600
 FMT = "%Y-%m-%dT%H:%M:%S"
+
+# Nuevos canales/grupos separados por comas. Se conserva GROUP_ID por compatibilidad.
+def leer_ids():
+    texto = os.environ.get("GROUP_IDS", "")
+    if not texto:
+        antiguo = os.environ.get("GROUP_ID")
+        texto = antiguo or ""
+    return [int(x) for x in texto.split(",") if x.strip()]
+
+GROUP_IDS_INICIO = leer_ids()
 
 
 def ahora():
@@ -93,7 +64,6 @@ def fecha_local(vence_iso):
 
 
 def fmt_seg(seg):
-    """Segundos a texto corto: 2d 3h 10m."""
     seg = max(int(seg), 0)
     d, r = divmod(seg, 86400)
     h, r = divmod(r, 3600)
@@ -112,9 +82,7 @@ def tiempo_restante(vence_iso):
     return fmt_seg((parse(vence_iso) - ahora()).total_seconds())
 
 
-# ---------- Base de datos (Postgres o SQLite) ----------
 def run(sql, params=(), fetch=None):
-    """Ejecuta SQL escrito con '?'. fetch: None, 'one' o 'all'."""
     if DATABASE_URL:
         import psycopg2
         import psycopg2.extras
@@ -125,7 +93,7 @@ def run(sql, params=(), fetch=None):
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(sql.replace("?", "%s"), params)
                     if fetch == "all":
-                        return [dict(r) for r in cur.fetchall()]
+                        return [dict(r) for r in cur.fetchall()] if cur.description else []
                     if fetch == "one":
                         r = cur.fetchone()
                         return dict(r) if r else None
@@ -146,74 +114,110 @@ def run(sql, params=(), fetch=None):
             conn.close()
 
 
+def tabla_existe(nombre):
+    if DATABASE_URL:
+        fila = run("SELECT to_regclass(?) AS name", (f"public.{nombre}",), "one")
+        return bool(fila and fila.get("name"))
+    fila = run("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (nombre,), "one")
+    return bool(fila)
+
+
 def init_db():
-    run(
-        """
-        CREATE TABLE IF NOT EXISTS miembros (
-            user_id BIGINT PRIMARY KEY,
-            nombre TEXT,
-            ultimo_pago TEXT,
-            vence TEXT NOT NULL,
-            recordatorios TEXT NOT NULL DEFAULT '',
-            estado TEXT NOT NULL DEFAULT 'activo'
-        )
-        """
+    run("""
+    CREATE TABLE IF NOT EXISTS grupos_v2 (
+        chat_id BIGINT PRIMARY KEY,
+        nombre TEXT,
+        activo TEXT NOT NULL DEFAULT '1'
     )
-    for col in ("renovaciones INTEGER NOT NULL DEFAULT 0", "expulsado_en TEXT"):
-        try:  # migración simple: ignora si la columna ya existe
-            run(f"ALTER TABLE miembros ADD COLUMN {col}")
-        except Exception:
-            pass
-    run(
-        """
-        CREATE TABLE IF NOT EXISTS llaves (
-            codigo TEXT PRIMARY KEY,
-            segundos BIGINT NOT NULL,
-            creada TEXT NOT NULL,
-            estado TEXT NOT NULL DEFAULT 'disponible',
-            usada_por BIGINT,
-            usada_en TEXT
-        )
-        """
+    """)
+    run("""
+    CREATE TABLE IF NOT EXISTS miembros_v2 (
+        chat_id BIGINT NOT NULL,
+        user_id BIGINT NOT NULL,
+        nombre TEXT,
+        ultimo_pago TEXT,
+        vence TEXT NOT NULL,
+        recordatorios TEXT NOT NOT NULL DEFAULT '',
+        estado TEXT NOT NULL DEFAULT 'activo',
+        renovaciones INTEGER NOT NULL DEFAULT 0,
+        expulsado_en TEXT,
+        PRIMARY KEY (chat_id, user_id)
     )
+    """)
+    run("""
+    CREATE TABLE IF NOT EXISTS llaves_v2 (
+        codigo TEXT PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        segundos BIGINT NOT NULL,
+        creada TEXT NOT NULL,
+        estado TEXT NOT NULL DEFAULT 'disponible',
+        usada_por BIGINT,
+        usada_en TEXT
+    )
+    """)
+
+    # Migra datos anteriores de un solo canal conservando ambos formatos de versión.
+    for chat_id in GROUP_IDS_INICIO:
+        run("INSERT INTO grupos_v2 (chat_id, nombre) VALUES (?, ?) ON CONFLICT (chat_id) DO NOTHING", (chat_id, str(chat_id)))
+
+    if tabla_existe("miembros"):
+        antiguas = run("SELECT * FROM miembros", (), "all") or []
+        for fila in antiguas:
+            for chat_id in GROUP_IDS_INICIO:
+                run("""
+                INSERT INTO miembros_v2
+                (chat_id, user_id, nombre, ultimo_pago, vence, recordatorios, estado, renovaciones, expulsado_en)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (chat_id, user_id) DO NOTHING
+                """, (chat_id, fila["user_id"], fila.get("nombre"), fila.get("ultimo_pago"), fila["vence"], fila.get("recordatorios") or "", fila.get("estado") or "activo", fila.get("renovaciones") or 0, fila.get("expulsado_en")))
+
     log.info("Base de datos: %s", "Postgres" if DATABASE_URL else f"SQLite ({DB_PATH})")
 
 
-def obtener(uid):
-    return run("SELECT * FROM miembros WHERE user_id = ?", (uid,), "one")
+def grupos():
+    filas = run("SELECT chat_id, nombre, activo FROM grupos_v2 WHERE activo='1' ORDER BY chat_id", (), "all") or []
+    if not filas:
+        for chat_id in GROUP_IDS_INICIO:
+            run("INSERT INTO grupos_v2 (chat_id, nombre) VALUES (?, ?) ON CONFLICT (chat_id) DO NOTHING", (chat_id, str(chat_id)))
+        filas = run("SELECT chat_id, nombre, activo FROM grupos_v2 WHERE activo='1' ORDER BY chat_id", (), "all") or []
+    return filas
 
 
-def registrar_td(uid, nombre, delta, sumar=True):
-    """Crea o renueva. Si sumar=True y sigue vigente, suma desde su vencimiento."""
+def grupo(chat_id):
+    return run("SELECT * FROM grupos_v2 WHERE chat_id=?", (chat_id,), "one")
+
+
+def obtener(chat_id, uid):
+    return run("SELECT * FROM miembros_v2 WHERE chat_id=? AND user_id=?", (chat_id, uid), "one")
+
+
+def registrar_td(chat_id, uid, nombre, delta, sumar=True):
     ahora_ = ahora()
-    fila = obtener(uid)
+    fila = obtener(chat_id, uid)
     base = ahora_
     if sumar and fila and fila["estado"] == "activo" and parse(fila["vence"]) > base:
         base = parse(fila["vence"])
     vence = base + delta
-    run(
-        """
-        INSERT INTO miembros (user_id, nombre, ultimo_pago, vence, recordatorios, estado)
-        VALUES (?, ?, ?, ?, '', 'activo')
-        ON CONFLICT (user_id) DO UPDATE SET
-            nombre = COALESCE(EXCLUDED.nombre, miembros.nombre),
-            ultimo_pago = EXCLUDED.ultimo_pago,
-            vence = EXCLUDED.vence,
-            recordatorios = '',
-            estado = 'activo',
-            renovaciones = miembros.renovaciones + ?,
-            expulsado_en = NULL
-        """,
-        (uid, nombre, iso(ahora_), iso(vence), 1 if fila else 0),
-    )
+    run("""
+    INSERT INTO miembros_v2
+    (chat_id, user_id, nombre, ultimo_pago, vence, recordatorios, estado, renovaciones, expulsado_en)
+    VALUES (?, ?, ?, ?, ?, '', 'activo', 0, NULL)
+    ON CONFLICT (chat_id, user_id) DO UPDATE SET
+        nombre=COALESCE(EXCLUDED.nombre, miembros_v2.nombre),
+        ultimo_pago=EXCLUDED.ultimo_pago,
+        vence=EXCLUDED.vence,
+        recordatorios='',
+        estado='activo',
+        renovaciones=miembros_v2.renovaciones + ?,
+        expulsado_en=NULL
+    """, (chat_id, uid, nombre, iso(ahora_), iso(vence), 1 if fila else 0))
     return iso(vence)
 
 
-def registrar(uid, nombre, dias, sumar=True):
-    return registrar_td(uid, nombre, timedelta(days=dias), sumar)
+def registrar(chat_id, uid, nombre, dias, sumar=True):
+    return registrar_td(chat_id, uid, nombre, timedelta(days=dias), sumar)
 
 
-# ---------- Utilidades ----------
 def solo_admin(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -221,7 +225,6 @@ def solo_admin(func):
             await update.message.reply_text("No tienes permiso para usar este comando.")
             return
         return await func(update, context)
-
     return wrapper
 
 
@@ -233,25 +236,17 @@ async def avisar_admins(context, texto):
             log.warning("No pude avisar al admin %s: %s", adm, e)
 
 
-async def sacar_del_canal(context, uid):
-    """Expulsa sin bloquear. Devuelve True si funcionó."""
+async def sacar_del_canal(context, chat_id, uid):
     try:
-        await context.bot.ban_chat_member(GROUP_ID, uid)
-        await context.bot.unban_chat_member(GROUP_ID, uid, only_if_banned=True)
+        await context.bot.ban_chat_member(chat_id, uid)
+        await context.bot.unban_chat_member(chat_id, uid, only_if_banned=True)
         return True
     except TelegramError as e:
-        log.error("No pude expulsar a %s: %s", uid, e)
+        log.error("No pude expulsar a %s de %s: %s", uid, chat_id, e)
         return False
 
 
-def uid_arg(context):
-    if context.args and context.args[0].isdigit():
-        return int(context.args[0])
-    return None
-
-
 def parse_duracion(txt):
-    """'30d', '12h', '90m' -> segundos (o None si no es válido)."""
     m = re.fullmatch(r"(\d+)([mhd])", txt.strip().lower())
     if not m or int(m.group(1)) <= 0:
         return None
@@ -259,37 +254,38 @@ def parse_duracion(txt):
 
 
 def nuevo_codigo():
-    return "-".join(
-        "".join(secrets.choice(ALFABETO) for _ in range(4)) for _ in range(3)
-    )
+    return "-".join("".join(secrets.choice(ALFABETO) for _ in range(4)) for _ in range(3))
 
 
-async def crear_enlace(context):
-    link = await context.bot.create_chat_invite_link(
-        GROUP_ID,
-        member_limit=1,
-        expire_date=int(ahora().timestamp()) + VIGENCIA_ENLACE,
-    )
+async def crear_enlace(context, chat_id):
+    link = await context.bot.create_chat_invite_link(chat_id, member_limit=1, expire_date=int(ahora().timestamp()) + VIGENCIA_ENLACE)
     return link.invite_link
 
 
-async def ya_esta_en_canal(context, uid):
+async def ya_esta_en_canal(context, chat_id, uid):
     try:
-        m = await context.bot.get_chat_member(GROUP_ID, uid)
+        m = await context.bot.get_chat_member(chat_id, uid)
         return m.status in ("member", "administrator", "creator")
     except TelegramError:
         return False
 
 
-# ---------- Comandos ----------
+def chat_por_argumento(context, posicion=0):
+    if len(context.args) > posicion:
+        try:
+            chat_id = int(context.args[posicion])
+            if grupo(chat_id):
+                return chat_id
+        except ValueError:
+            pass
+    lista = grupos()
+    if len(lista) == 1:
+        return int(lista[0]["chat_id"])
+    return None
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hola. Este bot controla las membresías del canal.\n"
-        "Para ver cuánto tiempo te queda: /tiempo\n"
-        "Si tienes una llave, actívala con: /canjear TU-LLAVE\n"
-        "Si tu enlace venció y tu membresía sigue activa: /enlace\n"
-        "Usa /miid para ver tu ID y compartirlo con el administrador."
-    )
+    await update.message.reply_text("Hola. Este bot controla membresías por canal o grupo.\n/tiempo - ver tu tiempo\n/canjear LLAVE - activar\n/enlace - solicitar enlace")
 
 
 async def miid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -299,227 +295,191 @@ async def miid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @solo_admin
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Comandos de administrador:\n"
-        "/pago ID [Nombre] - renueva con los días por defecto\n"
-        "/agregar ID DIAS [Nombre] - registra o suma días\n"
-        "/estado ID - días restantes\n"
-        "/lista - miembros activos\n"
-        "/usuarios - todos: activos, salidos, tiempo y renovaciones\n"
-        "/vencer ID - hace vencer ahora (para pruebas)\n"
-        "/quitar ID - elimina y expulsa\n"
-        "/llave 30d - crea una llave (m = minutos, h = horas, d = días)\n"
-        "/llaves - ver llaves disponibles y usadas\n"
-        "/revocar CODIGO - anula una llave sin usar"
+        "Administración multicanal:\n"
+        "/canal CHAT_ID [Nombre] - registra un canal/grupo\n"
+        "/grupos - lista canales registrados\n"
+        "/agregar CHAT_ID ID DIAS [Nombre]\n"
+        "/pago CHAT_ID ID [Nombre]\n"
+        "/estado CHAT_ID ID\n"
+        "/lista CHAT_ID\n"
+        "/usuarios CHAT_ID\n"
+        "/vencer CHAT_ID ID\n"
+        "/quitar CHAT_ID ID\n"
+        "/llave DURACION CHAT_ID\n"
+        "/llaves - llaves disponibles y usadas\n"
+        "/revocar CODIGO"
     )
+
+
+@solo_admin
+async def canal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not context.args:
+        await update.message.reply_text("Uso privado: /canal CHAT_ID [Nombre]")
+        return
+    try:
+        chat_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("CHAT_ID debe ser un número negativo, ejemplo -1001234567890.")
+        return
+    nombre = " ".join(context.args[1:]) or str(chat_id)
+    run("INSERT INTO grupos_v2 (chat_id,nombre) VALUES (?,?) ON CONFLICT (chat_id) DO UPDATE SET nombre=EXCLUDED.nombre, activo='1'", (chat_id, nombre))
+    await update.message.reply_text(f"Canal/grupo registrado: {nombre} ({chat_id})")
+
+
+@solo_admin
+async def canales(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    filas = grupos()
+    if not filas:
+        await update.message.reply_text("No hay canales registrados.")
+        return
+    await update.message.reply_text("Canales registrados:\n" + "\n".join(f"{f['nombre']} ({f['chat_id']})" for f in filas))
 
 
 @solo_admin
 async def agregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     a = context.args
-    if len(a) < 2 or not a[0].isdigit() or not a[1].isdigit():
-        await update.message.reply_text("Uso: /agregar ID DIAS [Nombre]")
+    if len(a) < 3:
+        await update.message.reply_text("Uso: /agregar CHAT_ID ID DIAS [Nombre]")
         return
-    uid, dias = int(a[0]), int(a[1])
-    nombre = " ".join(a[2:]) or None
-    vence = registrar(uid, nombre, dias)
-    log.info("Membresía registrada: %s (%s) +%s días", nombre, uid, dias)
-    await update.message.reply_text(
-        f"Membresía de {nombre or uid} activa hasta {fecha_local(vence)}."
-    )
+    try:
+        chat_id, uid, dias = int(a[0]), int(a[1]), int(a[2])
+    except ValueError:
+        await update.message.reply_text("CHAT_ID, ID y DIAS deben ser números.")
+        return
+    if not grupo(chat_id):
+        await update.message.reply_text("Ese canal/grupo no está registrado. Usa /canal CHAT_ID.")
+        return
+    nombre = " ".join(a[3:]) or None
+    vence = registrar(chat_id, uid, nombre, dias)
+    await update.message.reply_text(f"Membresía activa hasta {fecha_local(vence)} en {chat_id}.")
 
 
 @solo_admin
 async def pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = uid_arg(context)
-    if uid is None:
-        await update.message.reply_text("Uso: /pago ID [Nombre]")
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /pago CHAT_ID ID [Nombre]")
         return
-    nombre = " ".join(context.args[1:]) or None
-    vence = registrar(uid, nombre, DIAS_MEMBRESIA)
-    log.info("Pago registrado: %s (+%s días)", uid, DIAS_MEMBRESIA)
-    await update.message.reply_text(
-        f"Pago registrado. Activa hasta {fecha_local(vence)} ({DIAS_MEMBRESIA} días)."
-    )
+    try:
+        chat_id, uid = int(context.args[0]), int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("CHAT_ID e ID deben ser números.")
+        return
+    if not grupo(chat_id):
+        await update.message.reply_text("Ese canal/grupo no está registrado.")
+        return
+    nombre = " ".join(context.args[2:]) or None
+    vence = registrar(chat_id, uid, nombre, DIAS_MEMBRESIA)
+    await update.message.reply_text(f"Pago registrado hasta {fecha_local(vence)} en {chat_id}.")
 
 
 @solo_admin
 async def estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = uid_arg(context)
-    if uid is None:
-        await update.message.reply_text("Uso: /estado ID")
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /estado CHAT_ID ID")
         return
-    f = obtener(uid)
+    chat_id, uid = int(context.args[0]), int(context.args[1])
+    f = obtener(chat_id, uid)
     if not f:
-        await update.message.reply_text("Ese usuario no está registrado.")
-        return
-    if f["estado"] != "activo":
+        await update.message.reply_text("Ese usuario no está registrado en ese canal/grupo.")
+    elif f["estado"] != "activo":
         await update.message.reply_text(f"{f['nombre'] or uid}: expulsado por vencimiento.")
-        return
-    await update.message.reply_text(
-        f"{f['nombre'] or uid}: quedan {tiempo_restante(f['vence'])} "
-        f"(vence {fecha_local(f['vence'])})."
-    )
+    else:
+        await update.message.reply_text(f"{f['nombre'] or uid}: quedan {tiempo_restante(f['vence'])} (vence {fecha_local(f['vence'])}).")
 
 
 async def tiempo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    f = obtener(update.effective_user.id)
-    if not f:
-        await update.message.reply_text(
-            "No tienes una membresía registrada. Para obtenerla usa "
-            "/canjear TU-LLAVE."
-        )
+    chat_id = chat_por_argumento(context)
+    if chat_id is None:
+        await update.message.reply_text("Indica el canal: /tiempo CHAT_ID")
         return
-    if f["estado"] != "activo" or parse(f["vence"]) <= ahora():
-        await update.message.reply_text(
-            "Tu membresía venció. Para renovarla usa /canjear TU-LLAVE."
-        )
+    f = obtener(chat_id, update.effective_user.id)
+    if not f or f["estado"] != "activo" or parse(f["vence"]) <= ahora():
+        await update.message.reply_text("Tu membresía venció o no existe en ese canal/grupo.")
         return
-    await update.message.reply_text(
-        f"Te quedan {tiempo_restante(f['vence'])}.\n"
-        f"Tu membresía vence el {fecha_local(f['vence'])}."
-    )
+    await update.message.reply_text(f"Te quedan {tiempo_restante(f['vence'])}.\nVence el {fecha_local(f['vence'])}.")
 
 
 @solo_admin
 async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    filas = run(
-        "SELECT * FROM miembros WHERE estado = 'activo' ORDER BY vence", (), "all"
-    )
-    if not filas:
-        await update.message.reply_text("No hay membresías activas.")
+    if not context.args:
+        await update.message.reply_text("Uso: /lista CHAT_ID")
         return
-    lineas = [
-        f"{f['nombre'] or '-'} ({f['user_id']}): {tiempo_restante(f['vence'])}"
-        for f in filas
-    ]
-    bloque = f"Activos: {len(filas)}\n"
-    for linea in lineas:
-        if len(bloque) + len(linea) > 3500:
-            await update.message.reply_text(bloque)
-            bloque = ""
-        bloque += linea + "\n"
-    await update.message.reply_text(bloque)
+    chat_id = int(context.args[0])
+    filas = run("SELECT * FROM miembros_v2 WHERE chat_id=? AND estado='activo' ORDER BY vence", (chat_id,), "all") or []
+    await update.message.reply_text("Activos: " + str(len(filas)) if not filas else "Activos: " + str(len(filas)) + "\n" + "\n".join(f"{f['nombre'] or '-'} ({f['user_id']}): {tiempo_restante(f['vence'])}" for f in filas)[:3500])
 
 
 @solo_admin
 async def usuarios(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    filas = run("SELECT * FROM miembros ORDER BY vence", (), "all")
-    if not filas:
-        await update.message.reply_text("No hay usuarios registrados.")
+    if not context.args:
+        await update.message.reply_text("Uso: /usuarios CHAT_ID")
         return
-    activos = [f for f in filas if f["estado"] == "activo"]
-    salidos = [f for f in filas if f["estado"] != "activo"]
-    lineas = [f"ACTIVOS ({len(activos)})"]
-    for f in activos:
-        lineas.append(
-            f"{f['nombre'] or '-'} ({f['user_id']}): quedan {tiempo_restante(f['vence'])}"
-            f", vence {fecha_local(f['vence'])}, renovaciones: {f['renovaciones']}"
-        )
-    lineas.append("")
-    lineas.append(f"SALIERON POR VENCIMIENTO ({len(salidos)})")
-    for f in salidos:
-        cuando = f" el {fecha_local(f['expulsado_en'])}" if f.get("expulsado_en") else ""
-        lineas.append(
-            f"{f['nombre'] or '-'} ({f['user_id']}): venció {fecha_local(f['vence'])}"
-            f", expulsado{cuando}, renovaciones: {f['renovaciones']}"
-        )
-    bloque = ""
-    for linea in lineas:
-        if len(bloque) + len(linea) > 3500:
-            await update.message.reply_text(bloque)
-            bloque = ""
-        bloque += linea + "\n"
-    await update.message.reply_text(bloque)
+    chat_id = int(context.args[0])
+    filas = run("SELECT * FROM miembros_v2 WHERE chat_id=? ORDER BY vence", (chat_id,), "all") or []
+    lineas = [f"Usuarios del canal {chat_id}: {len(filas)}"]
+    for f in filas:
+        lineas.append(f"{f['nombre'] or '-'} ({f['user_id']}): {f['estado']} - vence {fecha_local(f['vence'])} - renovaciones {f['renovaciones']}")
+    await update.message.reply_text("\n".join(lineas)[:4000])
 
 
 @solo_admin
 async def vencer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = uid_arg(context)
-    if uid is None:
-        await update.message.reply_text("Uso: /vencer ID")
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /vencer CHAT_ID ID")
         return
-    if not obtener(uid):
+    chat_id, uid = int(context.args[0]), int(context.args[1])
+    if not obtener(chat_id, uid):
         await update.message.reply_text("Ese usuario no está registrado.")
         return
-    run(
-        "UPDATE miembros SET vence = ?, estado = 'activo' WHERE user_id = ?",
-        (iso(ahora() - timedelta(minutes=1)), uid),
-    )
-    await update.message.reply_text(
-        f"Marcado como vencido. Se expulsará en menos de {REVISION_SEGUNDOS} segundos."
-    )
+    run("UPDATE miembros_v2 SET vence=?, estado='activo' WHERE chat_id=? AND user_id=?", (iso(ahora() - timedelta(minutes=1)), chat_id, uid))
+    await update.message.reply_text("Marcado como vencido.")
 
 
 @solo_admin
 async def quitar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = uid_arg(context)
-    if uid is None:
-        await update.message.reply_text("Uso: /quitar ID")
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /quitar CHAT_ID ID")
         return
-    run("DELETE FROM miembros WHERE user_id = ?", (uid,))
-    ok = await sacar_del_canal(context, uid)
-    await update.message.reply_text(
-        f"{uid} eliminado y expulsado."
-        if ok
-        else f"{uid} eliminado de la base, pero no pude expulsarlo del canal."
-    )
+    chat_id, uid = int(context.args[0]), int(context.args[1])
+    run("DELETE FROM miembros_v2 WHERE chat_id=? AND user_id=?", (chat_id, uid))
+    ok = await sacar_del_canal(context, chat_id, uid)
+    await update.message.reply_text("Usuario eliminado y expulsado." if ok else "Eliminado de la base, pero no pude expulsarlo.")
 
 
-# ---------- Llaves de un solo uso ----------
 @solo_admin
 async def llave(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        await update.message.reply_text("Crea las llaves por privado con el bot.")
+    if update.effective_chat.type != "private" or not context.args:
+        await update.message.reply_text("Uso privado: /llave DURACION CHAT_ID")
         return
-    seg = parse_duracion(context.args[0]) if context.args else None
+    seg = parse_duracion(context.args[0])
+    chat_id = int(context.args[1]) if len(context.args) > 1 else None
     if not seg:
-        await update.message.reply_text(
-            "Uso: /llave 30d\n(m = minutos, h = horas, d = días)"
-        )
+        await update.message.reply_text("Uso: /llave 30d CHAT_ID (m, h o d)")
+        return
+    if chat_id is None:
+        lista = grupos()
+        if len(lista) == 1:
+            chat_id = int(lista[0]["chat_id"])
+        else:
+            await update.message.reply_text("Indica el canal: /llave 30d CHAT_ID")
+            return
+    if not grupo(chat_id):
+        await update.message.reply_text("Ese canal/grupo no está registrado.")
         return
     codigo = nuevo_codigo()
-    run(
-        "INSERT INTO llaves (codigo, segundos, creada) VALUES (?, ?, ?)",
-        (codigo, seg, iso(ahora())),
-    )
-    log.info("Llave creada: %s (%s)", codigo, fmt_seg(seg))
-    await update.message.reply_html(
-        f"Llave creada:\n<code>{codigo}</code>\n"
-        f"Duración: {fmt_seg(seg)} (empieza a contar cuando el usuario la canjee)."
-    )
+    run("INSERT INTO llaves_v2 (codigo,chat_id,segundos,creada) VALUES (?,?,?,?)", (codigo, chat_id, seg, iso(ahora())))
+    await update.message.reply_html(f"Llave creada para <b>{chat_id}</b>:\n<code>{codigo}</code>\nDuración: {fmt_seg(seg)}")
 
 
 @solo_admin
 async def llaves(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
-    disp = run(
-        "SELECT codigo, segundos FROM llaves WHERE estado = 'disponible' ORDER BY creada",
-        (),
-        "all",
-    )
-    usadas = run(
-        "SELECT codigo, usada_por, usada_en FROM llaves "
-        "WHERE estado = 'usada' ORDER BY usada_en DESC LIMIT 10",
-        (),
-        "all",
-    )
-    txt = f"<b>Disponibles ({len(disp)})</b>\n"
-    txt += (
-        "\n".join(f"<code>{f['codigo']}</code> · {fmt_seg(f['segundos'])}" for f in disp[:30])
-        or "—"
-    )
-    if len(disp) > 30:
-        txt += f"\n…y {len(disp) - 30} más"
-    txt += "\n\n<b>Usadas (últimas 10)</b>\n"
-    txt += (
-        "\n".join(
-            f"<code>{f['codigo']}</code> · {f['usada_por']} · {fecha_local(f['usada_en'])}"
-            for f in usadas
-        )
-        or "—"
-    )
-    await update.message.reply_html(txt)
+    disponibles = run("SELECT codigo,chat_id,segundos FROM llaves_v2 WHERE estado='disponible' ORDER BY creada", (), "all") or []
+    usadas = run("SELECT codigo,chat_id,usada_por,usada_en FROM llaves_v2 WHERE estado='usada' ORDER BY usada_en DESC LIMIT 10", (), "all") or []
+    texto = "Disponibles:\n" + ("\n".join(f"{f['codigo']} - {f['chat_id']} - {fmt_seg(f['segundos'])}" for f in disponibles[:30]) or "—")
+    texto += "\n\nUsadas:\n" + ("\n".join(f"{f['codigo']} - {f['chat_id']} - {f['usada_por']}" for f in usadas) or "—")
+    await update.message.reply_text(texto)
 
 
 @solo_admin
@@ -528,15 +488,8 @@ async def revocar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Uso: /revocar CODIGO")
         return
     codigo = context.args[0].strip().upper()
-    fila = run(
-        "UPDATE llaves SET estado = 'revocada' "
-        "WHERE codigo = ? AND estado = 'disponible' RETURNING codigo",
-        (codigo,),
-        "one",
-    )
-    await update.message.reply_text(
-        "Llave revocada." if fila else "No existe o ya fue usada."
-    )
+    fila = run("UPDATE llaves_v2 SET estado='revocada' WHERE codigo=? AND estado='disponible' RETURNING codigo", (codigo,), "one")
+    await update.message.reply_text("Llave revocada." if fila else "No existe o ya fue utilizada.")
 
 
 async def canjear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -546,88 +499,60 @@ async def canjear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Uso: /canjear TU-LLAVE")
         return
-
     user = update.effective_user
     codigo = context.args[0].strip().upper()
-
-    # Marca la llave como usada en un solo paso: si dos personas la canjean a la
-    # vez, solo una recibe la fila de vuelta.
-    fila = run(
-        "UPDATE llaves SET estado = 'usada', usada_por = ?, usada_en = ? "
-        "WHERE codigo = ? AND estado = 'disponible' RETURNING segundos",
-        (user.id, iso(ahora()), codigo),
-        "one",
-    )
+    fila = run("UPDATE llaves_v2 SET estado='usada', usada_por=?, usada_en=? WHERE codigo=? AND estado='disponible' RETURNING chat_id,segundos", (user.id, iso(ahora()), codigo), "one")
     if not fila:
         await update.message.reply_text("Llave inválida o ya utilizada.")
         return
-
+    chat_id = int(fila["chat_id"])
     segundos = int(fila["segundos"])
     try:
-        vence = registrar_td(user.id, user.full_name, timedelta(seconds=segundos))
+        vence = registrar_td(chat_id, user.id, user.full_name, timedelta(seconds=segundos))
     except Exception:
-        log.exception("Error registrando la membresía de la llave %s", codigo)
-        run(
-            "UPDATE llaves SET estado = 'disponible', usada_por = NULL, usada_en = NULL "
-            "WHERE codigo = ?",
-            (codigo,),
-        )
-        await update.message.reply_text(
-            "Hubo un error. Tu llave sigue vigente, intenta de nuevo en un momento."
-        )
+        log.exception("Error registrando llave %s", codigo)
+        run("UPDATE llaves_v2 SET estado='disponible', usada_por=NULL, usada_en=NULL WHERE codigo=?", (codigo,))
+        await update.message.reply_text("Hubo un error. Tu llave sigue vigente.")
         return
-
-    log.info("Llave %s canjeada por %s (%s)", codigo, user.full_name, user.id)
-    await avisar_admins(
-        context,
-        f"Llave {codigo} canjeada por {user.full_name} ({user.id}). "
-        f"Vence {fecha_local(vence)}.",
-    )
-
-    texto = (
-        f"Llave activada ({fmt_seg(segundos)}). "
-        f"Tu membresía vence el {fecha_local(vence)}."
-    )
-    if await ya_esta_en_canal(context, user.id):
+    texto = f"Llave activada para {chat_id}. ({fmt_seg(segundos)}) Vence el {fecha_local(vence)}."
+    await avisar_admins(context, f"Llave {codigo} canjeada por {user.full_name} ({user.id}) en {chat_id}. Vence {fecha_local(vence)}.")
+    if await ya_esta_en_canal(context, chat_id, user.id):
         await update.message.reply_text(texto + "\nYa estás dentro del canal.")
         return
     try:
-        url = await crear_enlace(context)
+        url = await crear_enlace(context, chat_id)
     except TelegramError as e:
-        log.error("No pude crear el enlace: %s", e)
-        await update.message.reply_text(
-            texto + "\nNo pude generar el enlace, escribe /enlace en un momento."
-        )
+        log.error("No pude crear enlace para %s: %s", chat_id, e)
+        await update.message.reply_text(texto + "\nNo pude generar el enlace.")
         return
-    await update.message.reply_text(
-        texto
-        + f"\n\nEntra aquí (sirve una sola vez y vence en {VIGENCIA_ENLACE // 60} min):\n{url}"
-    )
+    await update.message.reply_text(texto + f"\n\nEnlace exclusivo de una sola vez:\n{url}")
 
 
 async def enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
-    f = obtener(update.effective_user.id)
+    chat_id = chat_por_argumento(context)
+    if chat_id is None:
+        await update.message.reply_text("Indica el canal: /enlace CHAT_ID")
+        return
+    f = obtener(chat_id, update.effective_user.id)
     if not f or f["estado"] != "activo" or parse(f["vence"]) <= ahora():
-        await update.message.reply_text("No tienes una membresía activa.")
+        await update.message.reply_text("No tienes una membresía activa en ese canal/grupo.")
         return
     try:
-        url = await crear_enlace(context)
-    except TelegramError as e:
-        log.error("No pude crear el enlace: %s", e)
-        await update.message.reply_text("No pude generar el enlace, intenta de nuevo.")
+        url = await crear_enlace(context, chat_id)
+    except TelegramError:
+        await update.message.reply_text("No pude generar el enlace.")
         return
-    await update.message.reply_text(
-        f"Te quedan {tiempo_restante(f['vence'])}.\n"
-        f"Enlace (una sola vez, vence en {VIGENCIA_ENLACE // 60} min):\n{url}"
-    )
+    await update.message.reply_text(f"Enlace exclusivo de una sola vez para {chat_id}:\n{url}")
 
 
-# ---------- Entrada de nuevos miembros ----------
 async def nuevo_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cm = update.chat_member
-    if cm is None or cm.chat.id != GROUP_ID:
+    if cm is None:
+        return
+    chat_id = cm.chat.id
+    if not grupo(chat_id):
         return
     antes = cm.old_chat_member.status
     despues = cm.new_chat_member.status
@@ -636,108 +561,44 @@ async def nuevo_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not (antes in ("left", "kicked") and despues == "member"):
         return
-
-    nombre = user.full_name
-    fila = obtener(user.id)
-
-    # Ya estaba expulsado por vencimiento: no se regalan 30 días al volver a entrar
+    fila = obtener(chat_id, user.id)
     if fila and fila["estado"] == "expulsado":
-        log.info("Reingreso sin renovar: %s (%s)", nombre, user.id)
-        await sacar_del_canal(context, user.id)
-        try:
-            await context.bot.send_message(
-                user.id,
-                "Tu membresía venció. Contacta al administrador para renovar y volver a entrar.",
-            )
-        except TelegramError:
-            pass
-        await avisar_admins(
-            context, f"Reingreso sin renovar, expulsado de nuevo: {nombre} ({user.id})."
-        )
+        await sacar_del_canal(context, chat_id, user.id)
+        await avisar_admins(context, f"Reingreso sin renovar en {chat_id}: {user.full_name} ({user.id}).")
         return
-
-    # Ya tiene membresía vigente
     if fila and fila["estado"] == "activo" and parse(fila["vence"]) > ahora():
-        log.info("Usuario %s ya estaba registrado", user.id)
         return
-
     if not AUTO_REGISTRO:
-        await avisar_admins(
-            context, f"Entró sin membresía registrada: {nombre} ({user.id})."
-        )
+        await avisar_admins(context, f"Entró sin membresía registrada en {chat_id}: {user.full_name} ({user.id}).")
         return
-
-    vence = registrar(user.id, nombre, DIAS_MEMBRESIA, sumar=False)
-    log.info("Nuevo miembro: %s (%s)", nombre, user.id)
-    await avisar_admins(
-        context,
-        f"Nuevo miembro registrado: {nombre} ({user.id}). "
-        f"Vence {fecha_local(vence)}.",
-    )
+    vence = registrar(chat_id, user.id, user.full_name, DIAS_MEMBRESIA, sumar=False)
+    await avisar_admins(context, f"Nuevo miembro en {chat_id}: {user.full_name} ({user.id}). Vence {fecha_local(vence)}.")
 
 
-# ---------- Temporizador: recordatorios y expulsión ----------
 async def revisar(context: ContextTypes.DEFAULT_TYPE):
-    filas = run("SELECT * FROM miembros WHERE estado = 'activo'", (), "all")
+    filas = run("SELECT * FROM miembros_v2 WHERE estado='activo'", (), "all") or []
     ahora_ = ahora()
-
     for f in filas:
-        uid = f["user_id"]
-        nombre = f["nombre"] or uid
+        uid = int(f["user_id"])
+        chat_id = int(f["chat_id"])
         restante = (parse(f["vence"]) - ahora_).total_seconds()
-
-        # Vencido: expulsar
         if restante <= 0:
-            if await sacar_del_canal(context, uid):
-                run(
-                    "UPDATE miembros SET estado = 'expulsado', expulsado_en = ? "
-                    "WHERE user_id = ?",
-                    (iso(ahora()), uid),
-                )
-                log.info("EXPULSIÓN EXITOSA: %s (%s)", nombre, uid)
+            if await sacar_del_canal(context, chat_id, uid):
+                run("UPDATE miembros_v2 SET estado='expulsado', expulsado_en=? WHERE chat_id=? AND user_id=?", (iso(ahora()), chat_id, uid))
                 try:
-                    await context.bot.send_message(
-                        uid,
-                        "Tu membresía venció y fuiste retirado del canal. "
-                        "Contacta al administrador o canjea una llave nueva con /canjear.",
-                    )
+                    await context.bot.send_message(uid, f"Tu membresía del canal {chat_id} venció y fuiste retirado.")
                 except TelegramError:
                     pass
-                await avisar_admins(
-                    context, f"Expulsado por vencimiento: {nombre} ({uid})."
-                )
             continue
-
-        # Recordatorios (cada uno se envía una sola vez)
         enviados = {x for x in f["recordatorios"].split(",") if x}
-        # Duración total de esta membresía: no avisar "vence en 5 días" si dura menos
-        total = None
-        if f.get("ultimo_pago"):
-            total = (parse(f["vence"]) - parse(f["ultimo_pago"])).total_seconds()
-        alcanzados = [
-            d
-            for d in REMINDER_DAYS
-            if restante <= d * 86400
-            and str(d) not in enviados
-            and (total is None or d * 86400 < total)
-        ]
-        if not alcanzados:
-            continue
-        enviados.update(str(d) for d in alcanzados)
-        run(
-            "UPDATE miembros SET recordatorios = ? WHERE user_id = ?",
-            (",".join(sorted(enviados)), uid),
-        )
-        faltan = tiempo_restante(f["vence"])
-        log.info("ACCIÓN: recordatorio a %s (%s), quedan %s", nombre, uid, faltan)
-        try:
-            await context.bot.send_message(
-                uid,
-                f"Tu membresía vence en {faltan} ({fecha_local(f['vence'])}). "
-                "Contacta al administrador para renovar.",
-            )
-        except TelegramError as e:
-            log.warning("No pude enviar recordatorio a %s: %s", uid, e)
+        alcanzados = [d for d in REMINDER_DAYS if restante <= d * 86400 and str(d) not in enviados]
+        if alcanzados:
+            enviados.update(str(d) for d in alcanzados)
+            run("UPDATE miembros_v2 SET recordatorios=? WHERE chat_id=? AND user_id=?", (",".join(sorted(enviados)), chat_id, uid))
+            try:
+                await context.bot.send_message(uid, f"Tu membresía de {chat_id} vence en {tiempo_restante(f['vence'])} ({fecha_local(f['vence'])}).")
+            except TelegramError as e:
+                log.warning("No pude enviar recordatorio a %s: %s", uid, e)
 
 
 async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
@@ -749,13 +610,13 @@ def main():
     builder = Application.builder().token(TOKEN)
     if TELEGRAM_API_PROXY:
         builder = builder.base_url(TELEGRAM_API_PROXY + "/bot")
-        log.info("Usando proxy para la API de Telegram")
     app = builder.build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("miid", miid))
     app.add_handler(CommandHandler("tiempo", tiempo))
     app.add_handler(CommandHandler("ayuda", ayuda))
+    app.add_handler(CommandHandler("canal", canal))
+    app.add_handler(CommandHandler("grupos", canales))
     app.add_handler(CommandHandler("agregar", agregar))
     app.add_handler(CommandHandler("pago", pago))
     app.add_handler(CommandHandler("estado", estado))
@@ -770,10 +631,8 @@ def main():
     app.add_handler(CommandHandler("enlace", enlace))
     app.add_handler(ChatMemberHandler(nuevo_miembro, ChatMemberHandler.CHAT_MEMBER))
     app.add_error_handler(error_handler)
-
     app.job_queue.run_repeating(revisar, interval=REVISION_SEGUNDOS, first=10)
-
-    log.info("Bot en marcha...")
+    log.info("Bot multicanal en marcha")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

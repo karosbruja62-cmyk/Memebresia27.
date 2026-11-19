@@ -1,32 +1,35 @@
-# Bot de membresías para Telegram
+# Bot de membresías multicanal para Telegram
 
-Registra a quien entra al canal, avisa antes de vencer y expulsa al vencer.
+Administra membresías independientes para varios canales o grupos.
 
-## Variables (se ponen en Railway, nunca en el código)
+## Variables
 
-| Variable | Valor |
-|---|---|
-| BOT_TOKEN | token nuevo de @BotFather |
-| GROUP_ID | ID del canal, ej: -1004443921046 |
-| ADMIN_IDS | tu ID, ej: 8383881215 |
-| DATABASE_URL | `${{Postgres.DATABASE_URL}}` |
+- `BOT_TOKEN`: token de BotFather.
+- `ADMIN_IDS`: IDs de Telegram separados por comas.
+- `GROUP_IDS`: IDs negativos separados por comas. Ejemplo:
+  `-1004443921046,-1004368462644`
+- `DATABASE_URL`: PostgreSQL de Railway (opcional).
+- `DB_PATH`: SQLite local (por defecto `membresias_v2.db`).
+- `DIAS_MEMBRESIA`, `REMINDER_DAYS`, `REVISION_SEGUNDOS`, `TZ_OFFSET`, `AUTO_REGISTRO`.
 
-Opcionales: DIAS_MEMBRESIA (30), REMINDER_DAYS (5,2,1), REVISION_SEGUNDOS (60), TZ_OFFSET (-5), AUTO_REGISTRO (1).
+## Comandos principales
 
-## Comandos de administrador
+- `/canal CHAT_ID [Nombre]`
+- `/grupos`
+- `/llave 30d CHAT_ID`
+- `/llaves`
+- `/revocar CODIGO`
+- `/agregar CHAT_ID ID DIAS [Nombre]`
+- `/pago CHAT_ID ID [Nombre]`
+- `/estado CHAT_ID ID`
+- `/lista CHAT_ID`
+- `/usuarios CHAT_ID`
+- `/vencer CHAT_ID ID`
+- `/quitar CHAT_ID ID`
+- `/tiempo CHAT_ID`
+- `/enlace CHAT_ID`
+- `/canjear LLAVE`
 
-- /pago ID [Nombre]: renueva con los días por defecto
-- /agregar ID DIAS [Nombre]: registra o suma días
-- /tiempo: cualquier usuario ve cuánto le queda
-- /usuarios: listado completo (activos, salidos por vencimiento, tiempo restante, renovaciones)
-- /estado ID, /lista
-- /vencer ID: hace vencer ahora (pruebas)
-- /quitar ID: elimina y expulsa
+Cada llave queda asociada a un canal específico y solo puede canjearse una vez. Los enlaces tienen límite de una persona y caducidad de 10 minutos.
 
-## Desplegar
-
-1. Sube estos archivos a un repositorio PRIVADO de GitHub.
-2. En Railway: New Project > Deploy from GitHub repo.
-3. New > Database > PostgreSQL.
-4. En el servicio del bot > Variables, agrega las de arriba.
-5. Detén cualquier copia del bot que corra en otro lado (Termux) con el mismo token.
+El bot debe ser administrador en todos los canales/grupos y tener permiso para invitar miembros y expulsar usuarios.
