@@ -5,13 +5,15 @@ Bot de Telegram para controlar membresías de un canal o grupo (v2).
 - Envía recordatorios antes de vencer (una sola vez cada uno).
 - Expulsa automáticamente al vencer (sin bloquear: puede volver si renueva).
 - Usa Postgres si existe DATABASE_URL (Railway); si no, usa SQLite local.
+- Varios canales: cada canal tiene un #alias; membresías, llaves y enlaces son por canal.
 - Llaves de un solo uso (/llave, /canjear): el admin crea una llave con la
   duración que quiera; al canjearla empieza a correr el tiempo y al vencer
   se expulsa automáticamente. La llave queda inutilizable.
 
 Variables de entorno:
     BOT_TOKEN         token de @BotFather                      (obligatoria)
-    GROUP_ID          ID del canal/grupo, ej: -1001234567890   (obligatoria)
+    GROUP_ID          canal inicial (alias #principal)         (opcional)
+                      Los demás canales se registran solos al agregar el bot como admin.
     ADMIN_IDS         tus IDs separados por coma               (obligatoria)
     DATABASE_URL      cadena de Postgres (Railway la da)       (opcional)
     DIAS_MEMBRESIA    días por defecto                         (def. 30)
@@ -31,10 +33,18 @@ import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from telegram import Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
@@ -49,7 +59,8 @@ log = logging.getLogger("membresias")
 
 # ---------- Configuración ----------
 TOKEN = os.environ["BOT_TOKEN"]
-GROUP_ID = int(os.environ["GROUP_ID"])
+_g = os.environ.get("GROUP_ID", "").strip()
+GROUP_ID = int(_g) if _g else None  # opcional: canal inicial (alias "principal")
 ADMIN_IDS = {int(x) for x in os.environ["ADMIN_IDS"].split(",") if x.strip()}
 DATABASE_URL = os.environ.get("DATABASE_URL")
 DB_PATH = os.environ.get("DB_PATH", "membresias_v2.db")
@@ -176,41 +187,165 @@ def init_db():
         )
         """
     )
+    try:  # migración simple: cada llave pertenece a un canal
+        run("ALTER TABLE llaves ADD COLUMN chat_id BIGINT")
+    except Exception:
+        pass
+    run(
+        """
+        CREATE TABLE IF NOT EXISTS canales (
+            chat_id BIGINT PRIMARY KEY,
+            alias TEXT UNIQUE NOT NULL,
+            titulo TEXT,
+            activo INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    run(
+        """
+        CREATE TABLE IF NOT EXISTS membresias (
+            user_id BIGINT NOT NULL,
+            chat_id BIGINT NOT NULL,
+            nombre TEXT,
+            ultimo_pago TEXT,
+            vence TEXT NOT NULL,
+            recordatorios TEXT NOT NULL DEFAULT '',
+            estado TEXT NOT NULL DEFAULT 'activo',
+            renovaciones INTEGER NOT NULL DEFAULT 0,
+            expulsado_en TEXT,
+            PRIMARY KEY (user_id, chat_id)
+        )
+        """
+    )
+    if GROUP_ID is not None and not run(
+        "SELECT 1 AS x FROM canales WHERE chat_id = ?", (GROUP_ID,), "one"
+    ):
+        # Primera vez con varios canales: el canal de GROUP_ID hereda a los miembros actuales
+        run(
+            "INSERT INTO canales (chat_id, alias, activo) VALUES (?, 'principal', 1)",
+            (GROUP_ID,),
+        )
+        try:
+            run(
+                "INSERT INTO membresias (user_id, chat_id, nombre, ultimo_pago, vence, "
+                "recordatorios, estado, renovaciones, expulsado_en) "
+                "SELECT m.user_id, ?, m.nombre, m.ultimo_pago, m.vence, m.recordatorios, "
+                "m.estado, m.renovaciones, m.expulsado_en FROM miembros m WHERE 1=1 "
+                "ON CONFLICT (user_id, chat_id) DO NOTHING",
+                (GROUP_ID,),
+            )
+        except Exception:
+            log.exception("No pude migrar los miembros anteriores")
     log.info("Base de datos: %s", "Postgres" if DATABASE_URL else f"SQLite ({DB_PATH})")
 
 
-def obtener(uid):
-    return run("SELECT * FROM miembros WHERE user_id = ?", (uid,), "one")
+
+def obtener(uid, chat_id):
+    return run(
+        "SELECT * FROM membresias WHERE user_id = ? AND chat_id = ?", (uid, chat_id), "one"
+    )
 
 
-def registrar_td(uid, nombre, delta, sumar=True):
-    """Crea o renueva. Si sumar=True y sigue vigente, suma desde su vencimiento."""
+def registrar_td(uid, chat_id, nombre, delta, sumar=True):
+    """Crea o renueva en UN canal. Si sumar=True y sigue vigente, suma desde su vencimiento."""
     ahora_ = ahora()
-    fila = obtener(uid)
+    fila = obtener(uid, chat_id)
     base = ahora_
     if sumar and fila and fila["estado"] == "activo" and parse(fila["vence"]) > base:
         base = parse(fila["vence"])
     vence = base + delta
     run(
         """
-        INSERT INTO miembros (user_id, nombre, ultimo_pago, vence, recordatorios, estado)
-        VALUES (?, ?, ?, ?, '', 'activo')
-        ON CONFLICT (user_id) DO UPDATE SET
-            nombre = COALESCE(EXCLUDED.nombre, miembros.nombre),
+        INSERT INTO membresias (user_id, chat_id, nombre, ultimo_pago, vence, recordatorios, estado)
+        VALUES (?, ?, ?, ?, ?, '', 'activo')
+        ON CONFLICT (user_id, chat_id) DO UPDATE SET
+            nombre = COALESCE(EXCLUDED.nombre, membresias.nombre),
             ultimo_pago = EXCLUDED.ultimo_pago,
             vence = EXCLUDED.vence,
             recordatorios = '',
             estado = 'activo',
-            renovaciones = miembros.renovaciones + ?,
+            renovaciones = membresias.renovaciones + ?,
             expulsado_en = NULL
         """,
-        (uid, nombre, iso(ahora_), iso(vence), 1 if fila else 0),
+        (uid, chat_id, nombre, iso(ahora_), iso(vence), 1 if fila else 0),
     )
     return iso(vence)
 
 
-def registrar(uid, nombre, dias, sumar=True):
-    return registrar_td(uid, nombre, timedelta(days=dias), sumar)
+def registrar(uid, chat_id, nombre, dias, sumar=True):
+    return registrar_td(uid, chat_id, nombre, timedelta(days=dias), sumar)
+
+
+# ---------- Canales ----------
+def canales_activos():
+    return run("SELECT * FROM canales WHERE activo = 1 ORDER BY alias", (), "all")
+
+
+def alias_unico(titulo):
+    base = re.sub(r"[^a-z0-9]", "", (titulo or "canal").lower())[:12] or "canal"
+    alias, n = base, 1
+    while run("SELECT 1 AS x FROM canales WHERE alias = ?", (alias,), "one"):
+        n += 1
+        alias = f"{base}{n}"
+    return alias
+
+
+def registrar_canal(chat_id, titulo, alias=None):
+    """Alta o reactivación de un canal. Devuelve su alias."""
+    f = run("SELECT alias FROM canales WHERE chat_id = ?", (chat_id,), "one")
+    if f:
+        run(
+            "UPDATE canales SET titulo = ?, activo = 1 WHERE chat_id = ?", (titulo, chat_id)
+        )
+        return f["alias"]
+    alias = alias or alias_unico(titulo)
+    run(
+        "INSERT INTO canales (chat_id, alias, titulo, activo) VALUES (?, ?, ?, 1)",
+        (chat_id, alias, titulo),
+    )
+    return alias
+
+
+def canal_activo(chat_id):
+    return run(
+        "SELECT * FROM canales WHERE chat_id = ? AND activo = 1", (chat_id,), "one"
+    )
+
+
+def etiqueta(f):
+    """Nombre legible del canal de una fila que trae titulo/alias."""
+    return f.get("titulo") or f.get("alias") or str(f.get("chat_id"))
+
+
+def separar_alias(args):
+    """Saca el primer '#alias' de los argumentos. Devuelve (alias, resto)."""
+    alias, resto = None, []
+    for a in args or []:
+        if a.startswith("#") and len(a) > 1 and alias is None:
+            alias = a[1:].lower()
+        else:
+            resto.append(a)
+    return alias, resto
+
+
+def elegir_canal(alias):
+    """Devuelve (canal, error). Con un solo canal activo no hace falta #alias."""
+    activos = canales_activos()
+    if alias:
+        for c in activos:
+            if c["alias"] == alias:
+                return c, None
+        return None, f"No existe el canal #{alias}.\n" + texto_canales(activos)
+    if len(activos) == 1:
+        return activos[0], None
+    if not activos:
+        return None, "No hay canales registrados. Agrega el bot como administrador de un canal."
+    return None, "Hay varios canales, indica cuál con #alias:\n" + texto_canales(activos)
+
+
+def texto_canales(activos=None):
+    activos = canales_activos() if activos is None else activos
+    return "\n".join(f"#{c['alias']} - {c['titulo'] or c['chat_id']}" for c in activos) or "—"
 
 
 # ---------- Utilidades ----------
@@ -233,20 +368,21 @@ async def avisar_admins(context, texto):
             log.warning("No pude avisar al admin %s: %s", adm, e)
 
 
-async def sacar_del_canal(context, uid):
+
+async def sacar_del_canal(context, chat_id, uid):
     """Expulsa sin bloquear. Devuelve True si funcionó."""
     try:
-        await context.bot.ban_chat_member(GROUP_ID, uid)
-        await context.bot.unban_chat_member(GROUP_ID, uid, only_if_banned=True)
+        await context.bot.ban_chat_member(chat_id, uid)
+        await context.bot.unban_chat_member(chat_id, uid, only_if_banned=True)
         return True
     except TelegramError as e:
-        log.error("No pude expulsar a %s: %s", uid, e)
+        log.error("No pude expulsar a %s de %s: %s", uid, chat_id, e)
         return False
 
 
-def uid_arg(context):
-    if context.args and context.args[0].isdigit():
-        return int(context.args[0])
+def uid_arg(args):
+    if args and args[0].isdigit():
+        return int(args[0])
     return None
 
 
@@ -264,29 +400,78 @@ def nuevo_codigo():
     )
 
 
-async def crear_enlace(context):
+async def crear_enlace(context, chat_id):
+    """Enlace de un solo uso y válido solo para ESE canal."""
     link = await context.bot.create_chat_invite_link(
-        GROUP_ID,
+        chat_id,
         member_limit=1,
         expire_date=int(ahora().timestamp()) + VIGENCIA_ENLACE,
     )
     return link.invite_link
 
 
-async def ya_esta_en_canal(context, uid):
+async def ya_esta_en_canal(context, uid, chat_id):
     try:
-        m = await context.bot.get_chat_member(GROUP_ID, uid)
+        m = await context.bot.get_chat_member(chat_id, uid)
         return m.status in ("member", "administrator", "creator")
     except TelegramError:
         return False
 
 
 # ---------- Comandos ----------
+# Se muestran como menú con su descripción al escribir "/" en el chat.
+COMANDOS_USUARIO = [
+    ("start", "Cómo funciona el bot"),
+    ("tiempo", "Ver cuánto te queda en cada canal"),
+    ("canjear", "/canjear LLAVE: activa tu llave y recibe tu enlace"),
+    ("enlace", "Pedir un nuevo enlace de entrada a tu canal"),
+    ("miid", "Ver tu ID de Telegram"),
+]
+COMANDOS_ADMIN = COMANDOS_USUARIO + [
+    ("ayuda", "Lista de comandos de administrador"),
+    ("canales", "Ver los canales que administra el bot (#alias)"),
+    ("addcanal", "/addcanal CHAT_ID [alias]: registrar un canal a mano"),
+    ("quitarcanal", "/quitarcanal #alias: dejar de ofrecer un canal"),
+    ("llave", "/llave 30d [#alias]: crear una llave para un canal"),
+    ("llaves", "Ver llaves disponibles y usadas, con su canal"),
+    ("revocar", "/revocar CODIGO: anular una llave sin usar"),
+    ("pago", "/pago ID [Nombre] [#alias]: renovar con los días por defecto"),
+    ("agregar", "/agregar ID DIAS [Nombre] [#alias]: registrar o sumar días"),
+    ("estado", "/estado ID [#alias]: días restantes de un usuario"),
+    ("lista", "[#alias]: miembros activos"),
+    ("usuarios", "[#alias]: activos y salidos, con tiempo y renovaciones"),
+    ("vencer", "/vencer ID [#alias]: hacer vencer ahora (pruebas)"),
+    ("quitar", "/quitar ID [#alias]: eliminar y expulsar de un canal"),
+]
+
+
+async def post_init(app: Application):
+    try:
+        await app.bot.set_my_commands(
+            [BotCommand(c, d[:256]) for c, d in COMANDOS_USUARIO],
+            scope=BotCommandScopeDefault(),
+        )
+        for adm in ADMIN_IDS:
+            await app.bot.set_my_commands(
+                [BotCommand(c, d[:256]) for c, d in COMANDOS_ADMIN],
+                scope=BotCommandScopeChat(adm),
+            )
+    except TelegramError as e:
+        log.warning("No pude publicar el menú de comandos: %s", e)
+    # Completa el título de canales sembrados desde GROUP_ID
+    for c in run("SELECT chat_id FROM canales WHERE titulo IS NULL", (), "all"):
+        try:
+            ch = await app.bot.get_chat(c["chat_id"])
+            run("UPDATE canales SET titulo = ? WHERE chat_id = ?", (ch.title, c["chat_id"]))
+        except TelegramError as e:
+            log.warning("No pude leer el canal %s: %s", c["chat_id"], e)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hola. Este bot controla las membresías del canal.\n"
+        "Hola. Este bot controla las membresías de los canales.\n"
+        "Si tienes una llave, actívala con: /canjear TU-LLAVE (cada llave es para un solo canal)\n"
         "Para ver cuánto tiempo te queda: /tiempo\n"
-        "Si tienes una llave, actívala con: /canjear TU-LLAVE\n"
         "Si tu enlace venció y tu membresía sigue activa: /enlace\n"
         "Usa /miid para ver tu ID y compartirlo con el administrador."
     )
@@ -300,110 +485,198 @@ async def miid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Comandos de administrador:\n"
-        "/pago ID [Nombre] - renueva con los días por defecto\n"
-        "/agregar ID DIAS [Nombre] - registra o suma días\n"
-        "/estado ID - días restantes\n"
-        "/lista - miembros activos\n"
-        "/usuarios - todos: activos, salidos, tiempo y renovaciones\n"
-        "/vencer ID - hace vencer ahora (para pruebas)\n"
-        "/quitar ID - elimina y expulsa\n"
-        "/llave 30d - crea una llave (m = minutos, h = horas, d = días)\n"
-        "/llaves - ver llaves disponibles y usadas\n"
-        "/revocar CODIGO - anula una llave sin usar"
+        + "\n".join(f"/{c} - {d}" for c, d in COMANDOS_ADMIN)
+        + "\n\nCon varios canales añade #alias al comando (mira /canales). "
+        "Con un solo canal no hace falta."
+    )
+
+
+# ---------- Administración de canales ----------
+@solo_admin
+async def canales(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = texto_canales()
+    await update.message.reply_text(
+        f"Canales activos:\n{txt}\n\nPara agregar uno, añade el bot como administrador "
+        "del canal (con permiso de invitar) y se registra solo."
     )
 
 
 @solo_admin
-async def agregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def addcanal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     a = context.args
+    if not a or not re.fullmatch(r"-?\d+", a[0]):
+        await update.message.reply_text("Uso: /addcanal CHAT_ID [alias]")
+        return
+    chat_id = int(a[0])
+    alias = re.sub(r"[^a-z0-9]", "", a[1].lower())[:12] if len(a) > 1 else None
+    if alias and run("SELECT 1 AS x FROM canales WHERE alias = ? AND chat_id <> ?", (alias, chat_id), "one"):
+        await update.message.reply_text("Ese alias ya está en uso.")
+        return
+    try:
+        ch = await context.bot.get_chat(chat_id)
+    except TelegramError as e:
+        await update.message.reply_text(f"No pude acceder a ese canal: {e}")
+        return
+    alias = registrar_canal(chat_id, ch.title, alias or None)
+    await update.message.reply_text(f"Canal registrado: #{alias} - {ch.title}")
+
+
+@solo_admin
+async def quitarcanal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    alias, _ = separar_alias(context.args)
+    if not alias:
+        await update.message.reply_text("Uso: /quitarcanal #alias")
+        return
+    c, err = elegir_canal(alias)
+    if err:
+        await update.message.reply_text(err)
+        return
+    run("UPDATE canales SET activo = 0 WHERE chat_id = ?", (c["chat_id"],))
+    await update.message.reply_text(
+        f"#{alias} ya no se ofrece. Las membresías existentes no se tocan "
+        "y no se revisan mientras el canal esté desactivado."
+    )
+
+
+async def canal_cambio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """El bot fue agregado o quitado como administrador de un canal o grupo."""
+    m = update.my_chat_member
+    if m is None or m.chat.type == "private":
+        return
+    estado_nuevo = m.new_chat_member.status
+    if estado_nuevo == "administrator":
+        alias = registrar_canal(m.chat.id, m.chat.title)
+        await avisar_admins(context, f"Canal registrado: #{alias} - {m.chat.title} ({m.chat.id}).")
+    elif estado_nuevo in ("left", "kicked"):
+        run("UPDATE canales SET activo = 0 WHERE chat_id = ?", (m.chat.id,))
+        await avisar_admins(context, f"El bot salió de {m.chat.title}. Canal desactivado.")
+
+
+# ---------- Membresías (admin) ----------
+@solo_admin
+async def agregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    alias, a = separar_alias(context.args)
     if len(a) < 2 or not a[0].isdigit() or not a[1].isdigit():
-        await update.message.reply_text("Uso: /agregar ID DIAS [Nombre]")
+        await update.message.reply_text("Uso: /agregar ID DIAS [Nombre] [#alias]")
+        return
+    canal, err = elegir_canal(alias)
+    if err:
+        await update.message.reply_text(err)
         return
     uid, dias = int(a[0]), int(a[1])
     nombre = " ".join(a[2:]) or None
-    vence = registrar(uid, nombre, dias)
-    log.info("Membresía registrada: %s (%s) +%s días", nombre, uid, dias)
+    vence = registrar(uid, canal["chat_id"], nombre, dias)
+    log.info("Membresía registrada: %s (%s) +%s días en %s", nombre, uid, dias, canal["alias"])
     await update.message.reply_text(
-        f"Membresía de {nombre or uid} activa hasta {fecha_local(vence)}."
+        f"Membresía de {nombre or uid} en #{canal['alias']} activa hasta {fecha_local(vence)}."
     )
 
 
 @solo_admin
 async def pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = uid_arg(context)
+    alias, a = separar_alias(context.args)
+    uid = uid_arg(a)
     if uid is None:
-        await update.message.reply_text("Uso: /pago ID [Nombre]")
+        await update.message.reply_text("Uso: /pago ID [Nombre] [#alias]")
         return
-    nombre = " ".join(context.args[1:]) or None
-    vence = registrar(uid, nombre, DIAS_MEMBRESIA)
-    log.info("Pago registrado: %s (+%s días)", uid, DIAS_MEMBRESIA)
+    canal, err = elegir_canal(alias)
+    if err:
+        await update.message.reply_text(err)
+        return
+    nombre = " ".join(a[1:]) or None
+    vence = registrar(uid, canal["chat_id"], nombre, DIAS_MEMBRESIA)
+    log.info("Pago registrado: %s en %s (+%s días)", uid, canal["alias"], DIAS_MEMBRESIA)
     await update.message.reply_text(
-        f"Pago registrado. Activa hasta {fecha_local(vence)} ({DIAS_MEMBRESIA} días)."
+        f"Pago registrado en #{canal['alias']}. Activa hasta {fecha_local(vence)} "
+        f"({DIAS_MEMBRESIA} días)."
     )
+
+
+SQL_MEMB = (
+    "SELECT m.*, c.titulo, c.alias FROM membresias m "
+    "LEFT JOIN canales c ON c.chat_id = m.chat_id "
+)
 
 
 @solo_admin
 async def estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = uid_arg(context)
+    alias, a = separar_alias(context.args)
+    uid = uid_arg(a)
     if uid is None:
-        await update.message.reply_text("Uso: /estado ID")
+        await update.message.reply_text("Uso: /estado ID [#alias]")
         return
-    f = obtener(uid)
-    if not f:
+    filas = run(SQL_MEMB + "WHERE m.user_id = ? ORDER BY c.alias", (uid,), "all")
+    if alias:
+        filas = [f for f in filas if f["alias"] == alias]
+    if not filas:
         await update.message.reply_text("Ese usuario no está registrado.")
         return
-    if f["estado"] != "activo":
-        await update.message.reply_text(f"{f['nombre'] or uid}: expulsado por vencimiento.")
-        return
-    await update.message.reply_text(
-        f"{f['nombre'] or uid}: quedan {tiempo_restante(f['vence'])} "
-        f"(vence {fecha_local(f['vence'])})."
-    )
+    lineas = []
+    for f in filas:
+        if f["estado"] != "activo":
+            lineas.append(f"{etiqueta(f)}: expulsado por vencimiento.")
+        else:
+            lineas.append(
+                f"{etiqueta(f)}: quedan {tiempo_restante(f['vence'])} "
+                f"(vence {fecha_local(f['vence'])})."
+            )
+    await update.message.reply_text(f"{filas[0]['nombre'] or uid}\n" + "\n".join(lineas))
 
 
 async def tiempo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    f = obtener(update.effective_user.id)
-    if not f:
-        await update.message.reply_text(
-            "No tienes una membresía registrada. Para obtenerla usa "
-            "/canjear TU-LLAVE."
-        )
-        return
-    if f["estado"] != "activo" or parse(f["vence"]) <= ahora():
-        await update.message.reply_text(
-            "Tu membresía venció. Para renovarla usa /canjear TU-LLAVE."
-        )
-        return
-    await update.message.reply_text(
-        f"Te quedan {tiempo_restante(f['vence'])}.\n"
-        f"Tu membresía vence el {fecha_local(f['vence'])}."
-    )
-
-
-@solo_admin
-async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filas = run(
-        "SELECT * FROM miembros WHERE estado = 'activo' ORDER BY vence", (), "all"
+        SQL_MEMB + "WHERE m.user_id = ? ORDER BY c.alias", (update.effective_user.id,), "all"
     )
     if not filas:
-        await update.message.reply_text("No hay membresías activas.")
+        await update.message.reply_text(
+            "No tienes una membresía registrada. Para obtenerla usa /canjear TU-LLAVE."
+        )
         return
-    lineas = [
-        f"{f['nombre'] or '-'} ({f['user_id']}): {tiempo_restante(f['vence'])}"
-        for f in filas
-    ]
-    bloque = f"Activos: {len(filas)}\n"
+    lineas = []
+    for f in filas:
+        if f["estado"] != "activo" or parse(f["vence"]) <= ahora():
+            lineas.append(f"{etiqueta(f)}: venció. Renueva con /canjear TU-LLAVE.")
+        else:
+            lineas.append(
+                f"{etiqueta(f)}: te quedan {tiempo_restante(f['vence'])} "
+                f"(vence {fecha_local(f['vence'])})."
+            )
+    await update.message.reply_text("\n".join(lineas))
+
+
+async def enviar_bloques(update, lineas):
+    bloque = ""
     for linea in lineas:
         if len(bloque) + len(linea) > 3500:
             await update.message.reply_text(bloque)
             bloque = ""
         bloque += linea + "\n"
-    await update.message.reply_text(bloque)
+    if bloque:
+        await update.message.reply_text(bloque)
+
+
+@solo_admin
+async def lista(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    alias, _ = separar_alias(context.args)
+    filas = run(SQL_MEMB + "WHERE m.estado = 'activo' ORDER BY c.alias, m.vence", (), "all")
+    if alias:
+        filas = [f for f in filas if f["alias"] == alias]
+    if not filas:
+        await update.message.reply_text("No hay membresías activas.")
+        return
+    lineas = [f"Activos: {len(filas)}"] + [
+        f"[#{f['alias']}] {f['nombre'] or '-'} ({f['user_id']}): {tiempo_restante(f['vence'])}"
+        for f in filas
+    ]
+    await enviar_bloques(update, lineas)
 
 
 @solo_admin
 async def usuarios(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    filas = run("SELECT * FROM miembros ORDER BY vence", (), "all")
+    alias, _ = separar_alias(context.args)
+    filas = run(SQL_MEMB + "ORDER BY c.alias, m.vence", (), "all")
+    if alias:
+        filas = [f for f in filas if f["alias"] == alias]
     if not filas:
         await update.message.reply_text("No hay usuarios registrados.")
         return
@@ -412,101 +685,152 @@ async def usuarios(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lineas = [f"ACTIVOS ({len(activos)})"]
     for f in activos:
         lineas.append(
-            f"{f['nombre'] or '-'} ({f['user_id']}): quedan {tiempo_restante(f['vence'])}"
-            f", vence {fecha_local(f['vence'])}, renovaciones: {f['renovaciones']}"
+            f"[#{f['alias']}] {f['nombre'] or '-'} ({f['user_id']}): quedan "
+            f"{tiempo_restante(f['vence'])}, vence {fecha_local(f['vence'])}, "
+            f"renovaciones: {f['renovaciones']}"
         )
     lineas.append("")
     lineas.append(f"SALIERON POR VENCIMIENTO ({len(salidos)})")
     for f in salidos:
         cuando = f" el {fecha_local(f['expulsado_en'])}" if f.get("expulsado_en") else ""
         lineas.append(
-            f"{f['nombre'] or '-'} ({f['user_id']}): venció {fecha_local(f['vence'])}"
-            f", expulsado{cuando}, renovaciones: {f['renovaciones']}"
+            f"[#{f['alias']}] {f['nombre'] or '-'} ({f['user_id']}): venció "
+            f"{fecha_local(f['vence'])}, expulsado{cuando}, renovaciones: {f['renovaciones']}"
         )
-    bloque = ""
-    for linea in lineas:
-        if len(bloque) + len(linea) > 3500:
-            await update.message.reply_text(bloque)
-            bloque = ""
-        bloque += linea + "\n"
-    await update.message.reply_text(bloque)
+    await enviar_bloques(update, lineas)
 
 
 @solo_admin
 async def vencer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = uid_arg(context)
+    alias, a = separar_alias(context.args)
+    uid = uid_arg(a)
     if uid is None:
-        await update.message.reply_text("Uso: /vencer ID")
+        await update.message.reply_text("Uso: /vencer ID [#alias]")
         return
-    if not obtener(uid):
-        await update.message.reply_text("Ese usuario no está registrado.")
+    canal, err = elegir_canal(alias)
+    if err:
+        await update.message.reply_text(err)
+        return
+    if not obtener(uid, canal["chat_id"]):
+        await update.message.reply_text("Ese usuario no está registrado en ese canal.")
         return
     run(
-        "UPDATE miembros SET vence = ?, estado = 'activo' WHERE user_id = ?",
-        (iso(ahora() - timedelta(minutes=1)), uid),
+        "UPDATE membresias SET vence = ?, estado = 'activo' WHERE user_id = ? AND chat_id = ?",
+        (iso(ahora() - timedelta(minutes=1)), uid, canal["chat_id"]),
     )
     await update.message.reply_text(
-        f"Marcado como vencido. Se expulsará en menos de {REVISION_SEGUNDOS} segundos."
+        f"Marcado como vencido en #{canal['alias']}. "
+        f"Se expulsará en menos de {REVISION_SEGUNDOS} segundos."
     )
 
 
 @solo_admin
 async def quitar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = uid_arg(context)
+    alias, a = separar_alias(context.args)
+    uid = uid_arg(a)
     if uid is None:
-        await update.message.reply_text("Uso: /quitar ID")
+        await update.message.reply_text("Uso: /quitar ID [#alias]")
         return
-    run("DELETE FROM miembros WHERE user_id = ?", (uid,))
-    ok = await sacar_del_canal(context, uid)
+    canal, err = elegir_canal(alias)
+    if err:
+        await update.message.reply_text(err)
+        return
+    run(
+        "DELETE FROM membresias WHERE user_id = ? AND chat_id = ?", (uid, canal["chat_id"])
+    )
+    ok = await sacar_del_canal(context, canal["chat_id"], uid)
     await update.message.reply_text(
-        f"{uid} eliminado y expulsado."
+        f"{uid} eliminado y expulsado de #{canal['alias']}."
         if ok
-        else f"{uid} eliminado de la base, pero no pude expulsarlo del canal."
+        else f"{uid} eliminado de la base, pero no pude expulsarlo de #{canal['alias']}."
     )
 
 
-# ---------- Llaves de un solo uso ----------
+# ---------- Llaves de un solo uso (cada una vale para UN canal) ----------
+def crear_llave(seg, canal):
+    codigo = nuevo_codigo()
+    run(
+        "INSERT INTO llaves (codigo, segundos, creada, chat_id) VALUES (?, ?, ?, ?)",
+        (codigo, seg, iso(ahora()), canal["chat_id"]),
+    )
+    log.info("Llave creada: %s (%s) para %s", codigo, fmt_seg(seg), canal["alias"])
+    return (
+        f"Llave creada para #{canal['alias']} ({canal['titulo'] or canal['chat_id']}):\n"
+        f"<code>{codigo}</code>\n"
+        f"Duración: {fmt_seg(seg)} (empieza a contar cuando el usuario la canjee). "
+        "Solo abre ese canal."
+    )
+
+
 @solo_admin
 async def llave(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         await update.message.reply_text("Crea las llaves por privado con el bot.")
         return
-    seg = parse_duracion(context.args[0]) if context.args else None
+    alias, a = separar_alias(context.args)
+    seg = parse_duracion(a[0]) if a else None
     if not seg:
         await update.message.reply_text(
-            "Uso: /llave 30d\n(m = minutos, h = horas, d = días)"
+            "Uso: /llave 30d [#alias]\n(m = minutos, h = horas, d = días)"
         )
         return
-    codigo = nuevo_codigo()
-    run(
-        "INSERT INTO llaves (codigo, segundos, creada) VALUES (?, ?, ?)",
-        (codigo, seg, iso(ahora())),
-    )
-    log.info("Llave creada: %s (%s)", codigo, fmt_seg(seg))
-    await update.message.reply_html(
-        f"Llave creada:\n<code>{codigo}</code>\n"
-        f"Duración: {fmt_seg(seg)} (empieza a contar cuando el usuario la canjee)."
-    )
+    if not alias and len(canales_activos()) > 1:
+        kb = [
+            [InlineKeyboardButton(c["titulo"] or c["alias"], callback_data=f"llave:{seg}:{c['chat_id']}")]
+            for c in canales_activos()
+        ]
+        await update.message.reply_text(
+            f"¿Para qué canal es la llave de {fmt_seg(seg)}?",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+    canal, err = elegir_canal(alias)
+    if err:
+        await update.message.reply_text(err)
+        return
+    await update.message.reply_html(crear_llave(seg, canal))
+
+
+async def llave_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer("Sin permiso.", show_alert=True)
+        return
+    _, seg, chat_id = q.data.split(":")
+    canal = canal_activo(int(chat_id))
+    await q.answer()
+    if not canal:
+        await q.edit_message_text("Ese canal ya no está activo.")
+        return
+    await q.edit_message_text(crear_llave(int(seg), canal), parse_mode="HTML")
 
 
 @solo_admin
 async def llaves(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
+    etq = {c["chat_id"]: c["alias"] for c in run("SELECT * FROM canales", (), "all")}
+
+    def canal_de(f):
+        return etq.get(f["chat_id"] or GROUP_ID, "?")
+
     disp = run(
-        "SELECT codigo, segundos FROM llaves WHERE estado = 'disponible' ORDER BY creada",
+        "SELECT codigo, segundos, chat_id FROM llaves WHERE estado = 'disponible' ORDER BY creada",
         (),
         "all",
     )
     usadas = run(
-        "SELECT codigo, usada_por, usada_en FROM llaves "
+        "SELECT codigo, usada_por, usada_en, chat_id FROM llaves "
         "WHERE estado = 'usada' ORDER BY usada_en DESC LIMIT 10",
         (),
         "all",
     )
     txt = f"<b>Disponibles ({len(disp)})</b>\n"
     txt += (
-        "\n".join(f"<code>{f['codigo']}</code> · {fmt_seg(f['segundos'])}" for f in disp[:30])
+        "\n".join(
+            f"<code>{f['codigo']}</code> · {fmt_seg(f['segundos'])} · #{canal_de(f)}"
+            for f in disp[:30]
+        )
         or "—"
     )
     if len(disp) > 30:
@@ -514,7 +838,8 @@ async def llaves(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt += "\n\n<b>Usadas (últimas 10)</b>\n"
     txt += (
         "\n".join(
-            f"<code>{f['codigo']}</code> · {f['usada_por']} · {fecha_local(f['usada_en'])}"
+            f"<code>{f['codigo']}</code> · #{canal_de(f)} · {f['usada_por']} · "
+            f"{fecha_local(f['usada_en'])}"
             for f in usadas
         )
         or "—"
@@ -554,7 +879,7 @@ async def canjear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # vez, solo una recibe la fila de vuelta.
     fila = run(
         "UPDATE llaves SET estado = 'usada', usada_por = ?, usada_en = ? "
-        "WHERE codigo = ? AND estado = 'disponible' RETURNING segundos",
+        "WHERE codigo = ? AND estado = 'disponible' RETURNING segundos, chat_id",
         (user.id, iso(ahora()), codigo),
         "one",
     )
@@ -562,37 +887,51 @@ async def canjear(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Llave inválida o ya utilizada.")
         return
 
-    segundos = int(fila["segundos"])
-    try:
-        vence = registrar_td(user.id, user.full_name, timedelta(seconds=segundos))
-    except Exception:
-        log.exception("Error registrando la membresía de la llave %s", codigo)
+    def devolver_llave():
         run(
             "UPDATE llaves SET estado = 'disponible', usada_por = NULL, usada_en = NULL "
             "WHERE codigo = ?",
             (codigo,),
         )
+
+    segundos = int(fila["segundos"])
+    chat_id = fila["chat_id"] or GROUP_ID  # llaves antiguas sin canal: el canal original
+    canal = canal_activo(chat_id) if chat_id is not None else None
+    if not canal:
+        devolver_llave()
+        await update.message.reply_text(
+            "El canal de esta llave no está disponible. Avisa al administrador."
+        )
+        return
+    chat_id = canal["chat_id"]
+    nombre_canal = canal["titulo"] or canal["alias"]
+
+    try:
+        vence = registrar_td(user.id, chat_id, user.full_name, timedelta(seconds=segundos))
+    except Exception:
+        log.exception("Error registrando la membresía de la llave %s", codigo)
+        devolver_llave()
         await update.message.reply_text(
             "Hubo un error. Tu llave sigue vigente, intenta de nuevo en un momento."
         )
         return
 
-    log.info("Llave %s canjeada por %s (%s)", codigo, user.full_name, user.id)
+    log.info("Llave %s canjeada por %s (%s) en %s", codigo, user.full_name, user.id, canal["alias"])
     await avisar_admins(
         context,
-        f"Llave {codigo} canjeada por {user.full_name} ({user.id}). "
+        f"Llave {codigo} canjeada por {user.full_name} ({user.id}) en #{canal['alias']}. "
         f"Vence {fecha_local(vence)}.",
     )
 
     texto = (
-        f"Llave activada ({fmt_seg(segundos)}). "
+        f"Llave activada para {nombre_canal} ({fmt_seg(segundos)}). "
         f"Tu membresía vence el {fecha_local(vence)}."
     )
-    if await ya_esta_en_canal(context, user.id):
+    if await ya_esta_en_canal(context, user.id, chat_id):
         await update.message.reply_text(texto + "\nYa estás dentro del canal.")
         return
     try:
-        url = await crear_enlace(context)
+        url = await crear_enlace(context, chat_id)
     except TelegramError as e:
         log.error("No pude crear el enlace: %s", e)
         await update.message.reply_text(
@@ -605,30 +944,69 @@ async def canjear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def membresias_vigentes(uid):
+    filas = run(
+        SQL_MEMB + "WHERE m.user_id = ? AND m.estado = 'activo' AND c.activo = 1 "
+        "ORDER BY c.alias",
+        (uid,),
+        "all",
+    )
+    return [f for f in filas if parse(f["vence"]) > ahora()]
+
+
 async def enlace(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
-    f = obtener(update.effective_user.id)
-    if not f or f["estado"] != "activo" or parse(f["vence"]) <= ahora():
+    vigentes = membresias_vigentes(update.effective_user.id)
+    if not vigentes:
         await update.message.reply_text("No tienes una membresía activa.")
         return
+    if len(vigentes) > 1:
+        kb = [
+            [InlineKeyboardButton(etiqueta(f), callback_data=f"enl:{f['chat_id']}")]
+            for f in vigentes
+        ]
+        await update.message.reply_text(
+            "¿De qué canal quieres el enlace?", reply_markup=InlineKeyboardMarkup(kb)
+        )
+        return
+    await entregar_enlace(context, update.message.reply_text, vigentes[0])
+
+
+async def entregar_enlace(context, responder, f):
     try:
-        url = await crear_enlace(context)
+        url = await crear_enlace(context, f["chat_id"])
     except TelegramError as e:
         log.error("No pude crear el enlace: %s", e)
-        await update.message.reply_text("No pude generar el enlace, intenta de nuevo.")
+        await responder("No pude generar el enlace, intenta de nuevo.")
         return
-    await update.message.reply_text(
-        f"Te quedan {tiempo_restante(f['vence'])}.\n"
+    await responder(
+        f"{etiqueta(f)}: te quedan {tiempo_restante(f['vence'])}.\n"
         f"Enlace (una sola vez, vence en {VIGENCIA_ENLACE // 60} min):\n{url}"
     )
+
+
+async def enlace_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    chat_id = int(q.data.split(":")[1])
+    # Solo se entrega si ESE usuario tiene membresía vigente en ESE canal
+    for f in membresias_vigentes(q.from_user.id):
+        if f["chat_id"] == chat_id:
+            await entregar_enlace(context, q.message.reply_text, f)
+            return
+    await q.message.reply_text("No tienes una membresía activa en ese canal.")
 
 
 # ---------- Entrada de nuevos miembros ----------
 async def nuevo_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cm = update.chat_member
-    if cm is None or cm.chat.id != GROUP_ID:
+    if cm is None:
         return
+    canal = canal_activo(cm.chat.id)
+    if not canal:
+        return
+    chat_id = cm.chat.id
     antes = cm.old_chat_member.status
     despues = cm.new_chat_member.status
     user = cm.new_chat_member.user
@@ -638,12 +1016,13 @@ async def nuevo_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     nombre = user.full_name
-    fila = obtener(user.id)
+    fila = obtener(user.id, chat_id)
+    donde = f"#{canal['alias']}"
 
     # Ya estaba expulsado por vencimiento: no se regalan 30 días al volver a entrar
     if fila and fila["estado"] == "expulsado":
-        log.info("Reingreso sin renovar: %s (%s)", nombre, user.id)
-        await sacar_del_canal(context, user.id)
+        log.info("Reingreso sin renovar: %s (%s) en %s", nombre, user.id, donde)
+        await sacar_del_canal(context, chat_id, user.id)
         try:
             await context.bot.send_message(
                 user.id,
@@ -652,59 +1031,67 @@ async def nuevo_miembro(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except TelegramError:
             pass
         await avisar_admins(
-            context, f"Reingreso sin renovar, expulsado de nuevo: {nombre} ({user.id})."
+            context,
+            f"Reingreso sin renovar en {donde}, expulsado de nuevo: {nombre} ({user.id}).",
         )
         return
 
     # Ya tiene membresía vigente
     if fila and fila["estado"] == "activo" and parse(fila["vence"]) > ahora():
-        log.info("Usuario %s ya estaba registrado", user.id)
+        log.info("Usuario %s ya estaba registrado en %s", user.id, donde)
         return
 
     if not AUTO_REGISTRO:
         await avisar_admins(
-            context, f"Entró sin membresía registrada: {nombre} ({user.id})."
+            context, f"Entró sin membresía registrada a {donde}: {nombre} ({user.id})."
         )
         return
 
-    vence = registrar(user.id, nombre, DIAS_MEMBRESIA, sumar=False)
-    log.info("Nuevo miembro: %s (%s)", nombre, user.id)
+    vence = registrar(user.id, chat_id, nombre, DIAS_MEMBRESIA, sumar=False)
+    log.info("Nuevo miembro: %s (%s) en %s", nombre, user.id, donde)
     await avisar_admins(
         context,
-        f"Nuevo miembro registrado: {nombre} ({user.id}). "
+        f"Nuevo miembro registrado en {donde}: {nombre} ({user.id}). "
         f"Vence {fecha_local(vence)}.",
     )
 
 
 # ---------- Temporizador: recordatorios y expulsión ----------
 async def revisar(context: ContextTypes.DEFAULT_TYPE):
-    filas = run("SELECT * FROM miembros WHERE estado = 'activo'", (), "all")
+    filas = run(
+        SQL_MEMB.replace("LEFT JOIN", "JOIN")
+        + "WHERE m.estado = 'activo' AND c.activo = 1",
+        (),
+        "all",
+    )
     ahora_ = ahora()
 
     for f in filas:
         uid = f["user_id"]
+        chat_id = f["chat_id"]
+        canal = etiqueta(f)
         nombre = f["nombre"] or uid
         restante = (parse(f["vence"]) - ahora_).total_seconds()
 
         # Vencido: expulsar
         if restante <= 0:
-            if await sacar_del_canal(context, uid):
+            if await sacar_del_canal(context, chat_id, uid):
                 run(
-                    "UPDATE miembros SET estado = 'expulsado', expulsado_en = ? "
-                    "WHERE user_id = ?",
-                    (iso(ahora()), uid),
+                    "UPDATE membresias SET estado = 'expulsado', expulsado_en = ? "
+                    "WHERE user_id = ? AND chat_id = ?",
+                    (iso(ahora()), uid, chat_id),
                 )
-                log.info("EXPULSIÓN EXITOSA: %s (%s)", nombre, uid)
+                log.info("EXPULSIÓN EXITOSA: %s (%s) de %s", nombre, uid, canal)
                 try:
                     await context.bot.send_message(
                         uid,
-                        "Tu membresía venció y fuiste retirado del canal. "
+                        f"Tu membresía de {canal} venció y fuiste retirado. "
                         "Contacta al administrador o canjea una llave nueva con /canjear.",
                     )
                 except TelegramError:
                     pass
                 await avisar_admins(
-                    context, f"Expulsado por vencimiento: {nombre} ({uid})."
+                    context, f"Expulsado por vencimiento de {canal}: {nombre} ({uid})."
                 )
             continue
 
@@ -725,15 +1112,15 @@ async def revisar(context: ContextTypes.DEFAULT_TYPE):
             continue
         enviados.update(str(d) for d in alcanzados)
         run(
-            "UPDATE miembros SET recordatorios = ? WHERE user_id = ?",
-            (",".join(sorted(enviados)), uid),
+            "UPDATE membresias SET recordatorios = ? WHERE user_id = ? AND chat_id = ?",
+            (",".join(sorted(enviados)), uid, chat_id),
         )
         faltan = tiempo_restante(f["vence"])
-        log.info("ACCIÓN: recordatorio a %s (%s), quedan %s", nombre, uid, faltan)
+        log.info("ACCIÓN: recordatorio a %s (%s) de %s, quedan %s", nombre, uid, canal, faltan)
         try:
             await context.bot.send_message(
                 uid,
-                f"Tu membresía vence en {faltan} ({fecha_local(f['vence'])}). "
+                f"Tu membresía de {canal} vence en {faltan} ({fecha_local(f['vence'])}). "
                 "Contacta al administrador para renovar.",
             )
         except TelegramError as e:
@@ -746,29 +1133,25 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
-    builder = Application.builder().token(TOKEN)
+    builder = Application.builder().token(TOKEN).post_init(post_init)
     if TELEGRAM_API_PROXY:
         builder = builder.base_url(TELEGRAM_API_PROXY + "/bot")
         log.info("Usando proxy para la API de Telegram")
     app = builder.build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("miid", miid))
-    app.add_handler(CommandHandler("tiempo", tiempo))
-    app.add_handler(CommandHandler("ayuda", ayuda))
-    app.add_handler(CommandHandler("agregar", agregar))
-    app.add_handler(CommandHandler("pago", pago))
-    app.add_handler(CommandHandler("estado", estado))
-    app.add_handler(CommandHandler("lista", lista))
-    app.add_handler(CommandHandler("usuarios", usuarios))
-    app.add_handler(CommandHandler("vencer", vencer))
-    app.add_handler(CommandHandler("quitar", quitar))
-    app.add_handler(CommandHandler("llave", llave))
-    app.add_handler(CommandHandler("llaves", llaves))
-    app.add_handler(CommandHandler("revocar", revocar))
-    app.add_handler(CommandHandler("canjear", canjear))
-    app.add_handler(CommandHandler("enlace", enlace))
+    for nombre, fn in [
+        ("start", start), ("miid", miid), ("tiempo", tiempo), ("ayuda", ayuda),
+        ("canales", canales), ("addcanal", addcanal), ("quitarcanal", quitarcanal),
+        ("agregar", agregar), ("pago", pago), ("estado", estado), ("lista", lista),
+        ("usuarios", usuarios), ("vencer", vencer), ("quitar", quitar),
+        ("llave", llave), ("llaves", llaves), ("revocar", revocar),
+        ("canjear", canjear), ("enlace", enlace),
+    ]:
+        app.add_handler(CommandHandler(nombre, fn))
+    app.add_handler(CallbackQueryHandler(llave_boton, pattern=r"^llave:"))
+    app.add_handler(CallbackQueryHandler(enlace_boton, pattern=r"^enl:"))
     app.add_handler(ChatMemberHandler(nuevo_miembro, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(canal_cambio, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_error_handler(error_handler)
 
     app.job_queue.run_repeating(revisar, interval=REVISION_SEGUNDOS, first=10)
