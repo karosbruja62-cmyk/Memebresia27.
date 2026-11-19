@@ -137,7 +137,7 @@ def init_db():
         nombre TEXT,
         ultimo_pago TEXT,
         vence TEXT NOT NULL,
-        recordatorios TEXT NOT NOT NULL DEFAULT '',
+        recordatorios TEXT NOT NULL DEFAULT '',
         estado TEXT NOT NULL DEFAULT 'activo',
         renovaciones INTEGER NOT NULL DEFAULT 0,
         expulsado_en TEXT,
