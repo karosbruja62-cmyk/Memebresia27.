@@ -25,6 +25,7 @@ Variables de entorno:
                       (usa 0 si vendes el acceso solo con llaves)
 """
 
+import html
 import logging
 import math
 import os
@@ -48,6 +49,8 @@ from telegram.ext import (
     ChatMemberHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 logging.basicConfig(
@@ -214,6 +217,21 @@ def init_db():
             renovaciones INTEGER NOT NULL DEFAULT 0,
             expulsado_en TEXT,
             PRIMARY KEY (user_id, chat_id)
+        )
+        """
+    )
+    run(
+        """
+        CREATE TABLE IF NOT EXISTS pagos (
+            id TEXT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            nombre TEXT,
+            chat_id BIGINT NOT NULL,
+            creado TEXT NOT NULL,
+            estado TEXT NOT NULL DEFAULT 'pendiente',
+            resuelto_por BIGINT,
+            resuelto_en TEXT,
+            codigo TEXT
         )
         """
     )
@@ -425,6 +443,7 @@ COMANDOS_USUARIO = [
     ("tiempo", "Ver cuánto te queda en cada canal"),
     ("canjear", "/canjear LLAVE: activa tu llave y recibe tu enlace"),
     ("enlace", "Pedir un nuevo enlace de entrada a tu canal"),
+    ("pago", "Enviar la captura de tu pago para pedir tu llave"),
     ("miid", "Ver tu ID de Telegram"),
 ]
 COMANDOS_ADMIN = COMANDOS_USUARIO + [
@@ -435,7 +454,7 @@ COMANDOS_ADMIN = COMANDOS_USUARIO + [
     ("llave", "/llave 30d [#alias]: crear una llave para un canal"),
     ("llaves", "Ver llaves disponibles y usadas, con su canal"),
     ("revocar", "/revocar CODIGO: anular una llave sin usar"),
-    ("pago", "/pago ID [Nombre] [#alias]: renovar con los días por defecto"),
+    ("pago", "/pago ID [Nombre] [#alias]: renovar (sin datos: flujo de usuario)"),
     ("agregar", "/agregar ID DIAS [Nombre] [#alias]: registrar o sumar días"),
     ("estado", "/estado ID [#alias]: días restantes de un usuario"),
     ("lista", "[#alias]: miembros activos"),
@@ -572,8 +591,7 @@ async def agregar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@solo_admin
-async def pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def pago_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     alias, a = separar_alias(context.args)
     uid = uid_arg(a)
     if uid is None:
@@ -590,6 +608,157 @@ async def pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Pago registrado en #{canal['alias']}. Activa hasta {fecha_local(vence)} "
         f"({DIAS_MEMBRESIA} días)."
     )
+
+
+
+async def pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin con argumentos: renueva a mano. Cualquier otro caso: flujo de pago con captura."""
+    user = update.effective_user
+    if user.id in ADMIN_IDS and context.args:
+        return await pago_admin(update, context)
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Escríbeme por privado para enviar tu pago.")
+        return
+    activos = canales_activos()
+    if not activos:
+        await update.message.reply_text("No hay canales disponibles por ahora.")
+        return
+    context.user_data.pop("pago_canal", None)
+    if len(activos) == 1:
+        context.user_data["pago_canal"] = activos[0]["chat_id"]
+        await update.message.reply_text(
+            f"Envíame ahora la captura de tu pago para {etiqueta(activos[0])}."
+        )
+        return
+    kb = [
+        [InlineKeyboardButton(etiqueta(c), callback_data=f"pc:{c['chat_id']}")]
+        for c in activos
+    ]
+    await update.message.reply_text(
+        "¿A qué canal quieres entrar?", reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+async def pago_canal_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    canal = canal_activo(int(q.data.split(":")[1]))
+    if not canal:
+        await q.edit_message_text("Ese canal ya no está disponible.")
+        return
+    context.user_data["pago_canal"] = canal["chat_id"]
+    await q.edit_message_text(
+        f"Canal elegido: {etiqueta(canal)}.\nEnvíame ahora la captura de tu pago."
+    )
+
+
+async def recibir_captura(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if update.effective_chat.type != "private":
+        return
+    user = update.effective_user
+    if msg.document and not (msg.document.mime_type or "").startswith("image/"):
+        return
+    chat_id = context.user_data.get("pago_canal")
+    if chat_id is None:
+        await msg.reply_text("Para enviar un pago escribe primero /pago.")
+        return
+    canal = canal_activo(chat_id)
+    if not canal:
+        context.user_data.pop("pago_canal", None)
+        await msg.reply_text("Ese canal ya no está disponible. Escribe /pago de nuevo.")
+        return
+    pid = secrets.token_hex(4)
+    run(
+        "INSERT INTO pagos (id, user_id, nombre, chat_id, creado) VALUES (?, ?, ?, ?, ?)",
+        (pid, user.id, user.full_name, chat_id, iso(ahora())),
+    )
+    context.user_data.pop("pago_canal", None)
+    caption = (
+        f"Pago por verificar\n{html.escape(user.full_name)} "
+        f"(<code>{user.id}</code>) pagó para {html.escape(etiqueta(canal))}."
+    )
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Aceptar", callback_data=f"pg:a:{pid}"),
+            InlineKeyboardButton("Rechazar", callback_data=f"pg:r:{pid}"),
+        ]]
+    )
+    enviado = False
+    for adm in ADMIN_IDS:
+        try:
+            await context.bot.copy_message(
+                adm, msg.chat_id, msg.message_id,
+                caption=caption, parse_mode="HTML", reply_markup=kb,
+            )
+            enviado = True
+        except TelegramError as e:
+            log.warning("No pude enviar el pago al admin %s: %s", adm, e)
+    if not enviado:
+        run("DELETE FROM pagos WHERE id = ?", (pid,))
+        await msg.reply_text("No pude avisar al administrador. Intenta de nuevo más tarde.")
+        return
+    log.info("Pago %s recibido de %s para %s", pid, user.id, canal["alias"])
+    await msg.reply_text(
+        "Recibí tu captura. El administrador la revisará y te enviaré tu llave si es aprobada."
+    )
+
+
+async def pago_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer("Sin permiso.", show_alert=True)
+        return
+    _, accion, pid = q.data.split(":")
+    nuevo = "aceptado" if accion == "a" else "rechazado"
+    # Un solo paso: si dos admins pulsan a la vez, solo uno gana
+    p = run(
+        "UPDATE pagos SET estado = ?, resuelto_por = ?, resuelto_en = ? "
+        "WHERE id = ? AND estado = 'pendiente' RETURNING user_id, nombre, chat_id",
+        (nuevo, q.from_user.id, iso(ahora()), pid),
+        "one",
+    )
+    if not p:
+        await q.answer("Este pago ya fue resuelto.", show_alert=True)
+        return
+    await q.answer()
+    canal = run("SELECT * FROM canales WHERE chat_id = ?", (p["chat_id"],), "one") or {
+        "chat_id": p["chat_id"]
+    }
+    base = f"{p['nombre']} ({p['user_id']}) - {etiqueta(canal)}"
+
+    if accion == "r":
+        try:
+            await context.bot.send_message(
+                p["user_id"],
+                "Tu pago fue rechazado. Si crees que es un error, contacta al administrador "
+                "y envía otra captura con /pago.",
+            )
+        except TelegramError as e:
+            log.warning("No pude avisar del rechazo a %s: %s", p["user_id"], e)
+        await q.edit_message_caption(f"Rechazado: {base}")
+        return
+
+    codigo = nuevo_codigo()
+    seg = DIAS_MEMBRESIA * 86400
+    run(
+        "INSERT INTO llaves (codigo, segundos, creada, chat_id) VALUES (?, ?, ?, ?)",
+        (codigo, seg, iso(ahora()), p["chat_id"]),
+    )
+    run("UPDATE pagos SET codigo = ? WHERE id = ?", (codigo, pid))
+    log.info("Pago %s aceptado, llave %s", pid, codigo)
+    try:
+        await context.bot.send_message(
+            p["user_id"],
+            f"Tu pago fue aceptado. Tu llave para {etiqueta(canal)}:\n"
+            f"<code>{codigo}</code>\n\nCanjéala con: /canjear {codigo}",
+            parse_mode="HTML",
+        )
+        entregada = "llave enviada al usuario"
+    except TelegramError as e:
+        log.warning("No pude enviar la llave a %s: %s", p["user_id"], e)
+        entregada = f"no pude escribirle; entrégale tú la llave {codigo}"
+    await q.edit_message_caption(f"Aceptado: {base} ({entregada}).")
 
 
 SQL_MEMB = (
@@ -1149,6 +1318,11 @@ def main():
     ]:
         app.add_handler(CommandHandler(nombre, fn))
     app.add_handler(CallbackQueryHandler(llave_boton, pattern=r"^llave:"))
+    app.add_handler(CallbackQueryHandler(pago_canal_boton, pattern=r"^pc:"))
+    app.add_handler(CallbackQueryHandler(pago_decision, pattern=r"^pg:"))
+    app.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.IMAGE, recibir_captura)
+    )
     app.add_handler(CallbackQueryHandler(enlace_boton, pattern=r"^enl:"))
     app.add_handler(ChatMemberHandler(nuevo_miembro, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(canal_cambio, ChatMemberHandler.MY_CHAT_MEMBER))
